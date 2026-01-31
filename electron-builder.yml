@@ -1,1 +1,17 @@
-
+appId: com.yourname.grandmastergame
+productName: "Grandmaster Steam Game"
+directories:
+  output: "dist"
+  buildResources: "build"
+files:
+  - "src/**/*"
+  - "package.json"
+win:
+  target: "nsis"
+  icon: "build/icon.ico"
+mac:
+  target: "dmg"
+  icon: "build/icon.icns"
+linux:
+  target: "AppImage"
+  icon: "build/icon.png"
