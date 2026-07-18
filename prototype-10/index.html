@@ -7,7 +7,7 @@
 <style>
   html, body { margin:0; padding:0; background:#0b0e14; height:100%; overflow:hidden; touch-action:none; }
   #wrap { display:flex; align-items:center; justify-content:center; height:100%; }
-  canvas { background:#151a23; box-shadow:0 0 60px rgba(0,0,0,.6); border-radius:6px; }
+  canvas { background:#151a23; box-shadow:0 0 60px rgba(0,0,0,.6); border-radius:6px; touch-action:none; }
 </style>
 </head>
 <body>
@@ -86,40 +86,44 @@ function beep(freq, dur, type, vol) {
 }
 
 // ---------- input ----------
-// Touch: RELATIVE drag — finger anywhere on screen, hero moves by the delta
-// (amplified), so your finger never covers the action and small flicks are
-// enough to dart between lanes. Mouse: hero follows the cursor x directly.
-let targetX = W / 2, dragLast = null;
-function toGame(e) {
+// Pointer events with capture, so one gesture keeps flowing no matter where
+// the pointer goes. Touch/pen: RELATIVE drag — finger anywhere, hero moves by
+// the amplified delta. Mouse: hero follows the cursor x directly.
+// targetX is clamped IN THE HANDLER: it must never accumulate past the field
+// edge, or reversing direction would first have to "drag back" invisible
+// overshoot before the hero responds.
+let targetX = W / 2, dragLast = null, dragId = null;
+const clampX = x => Math.max(24, Math.min(W - 24, x));
+function toGameX(clientX) {
   const r = cvs.getBoundingClientRect();
-  const cx = (e.touches ? e.touches[0].clientX : e.clientX);
-  return (cx - r.left) / r.width * W;
+  return (clientX - r.left) / r.width * W;
 }
 function ensureAudio() {
   if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (err) {} }
 }
-cvs.addEventListener('mousedown', e => {
+cvs.addEventListener('pointerdown', e => {
   ensureAudio();
   if (state !== 'play') startRun();
-  targetX = toGame(e);
+  dragId = e.pointerId;
+  dragLast = toGameX(e.clientX);
+  if (e.pointerType === 'mouse') targetX = clampX(dragLast);
+  try { cvs.setPointerCapture(e.pointerId); } catch (err) {}
   e.preventDefault();
 });
-cvs.addEventListener('mousemove', e => {
-  if (state === 'play') targetX = toGame(e);
-});
-cvs.addEventListener('touchstart', e => {
-  ensureAudio();
-  if (state !== 'play') startRun();
-  dragLast = toGame(e);
-  e.preventDefault();
-}, { passive:false });
-cvs.addEventListener('touchmove', e => {
-  const x = toGame(e);
-  if (dragLast != null) targetX += (x - dragLast) * TUNE.hero.dragSense;
+cvs.addEventListener('pointermove', e => {
+  if (state !== 'play') return;
+  const x = toGameX(e.clientX);
+  if (e.pointerType === 'mouse') { targetX = clampX(x); return; }
+  if (e.pointerId !== dragId || dragLast == null) return;
+  targetX = clampX(targetX + (x - dragLast) * TUNE.hero.dragSense);
   dragLast = x;
   e.preventDefault();
-}, { passive:false });
-window.addEventListener('touchend', () => dragLast = null);
+});
+function endDrag(e) {
+  if (e.pointerId === dragId) { dragId = null; dragLast = null; }
+}
+cvs.addEventListener('pointerup', endDrag);
+cvs.addEventListener('pointercancel', endDrag);
 
 // ---------- upgrades (bronze / silver / gold effects per tier) ----------
 const UPGRADES = [
