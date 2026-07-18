@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Prototype 10 — Reverse Gate Runner</title>
+<style>
+  html, body { margin:0; padding:0; background:#0b0e14; height:100%; overflow:hidden; touch-action:none; }
+  #wrap { display:flex; align-items:center; justify-content:center; height:100%; }
+  canvas { background:#151a23; box-shadow:0 0 60px rgba(0,0,0,.6); border-radius:6px; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="cvs" width="480" height="800"></canvas></div>
+<script>
+'use strict';
+const W = 480, H = 800;
+const cvs = document.getElementById('cvs');
+const ctx = cvs.getContext('2d');
+
+// ---------- responsive scale ----------
+function fit() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H) * 0.98;
+  cvs.style.width  = (W * s) + 'px';
+  cvs.style.height = (H * s) + 'px';
+}
+window.addEventListener('resize', fit); fit();
+
+// ---------- tiny audio ----------
+let AC = null;
+function beep(freq, dur, type, vol) {
+  if (!AC) return;
+  try {
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = type || 'square'; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol || 0.05, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
+    o.connect(g); g.connect(AC.destination);
+    o.start(); o.stop(AC.currentTime + dur);
+  } catch (e) {}
+}
+
+// ---------- input ----------
+let pointerX = W / 2, pressed = false;
+function toGame(e) {
+  const r = cvs.getBoundingClientRect();
+  const cx = (e.touches ? e.touches[0].clientX : e.clientX);
+  return (cx - r.left) / r.width * W;
+}
+function press(e) {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (err) {} }
+  pressed = true; pointerX = toGame(e);
+  if (state !== 'play') startRun();
+  e.preventDefault();
+}
+function move(e) { pointerX = toGame(e); e.preventDefault(); }
+cvs.addEventListener('mousedown', press);
+cvs.addEventListener('mousemove', e => { if (pressed || state === 'play') move(e); });
+window.addEventListener('mouseup', () => pressed = false);
+cvs.addEventListener('touchstart', press, { passive:false });
+cvs.addEventListener('touchmove', move, { passive:false });
+window.addEventListener('touchend', () => pressed = false);
+
+// ---------- upgrades ----------
+const UPGRADES = [
+  { key:'dmg',    label:'DAMAGE +50%',  color:'#4ade80', apply:p => p.dmg *= 1.5 },
+  { key:'rate',   label:'FIRE RATE ×1.35', color:'#facc15', apply:p => p.fireInt = Math.max(0.06, p.fireInt * 0.74) },
+  { key:'multi',  label:'+1 SHOT',      color:'#38bdf8', apply:p => p.shots += 1 },
+  { key:'pierce', label:'PIERCING +1',  color:'#c084fc', apply:p => p.pierce += 1 },
+  { key:'ally',   label:'+1 ALLY',      color:'#fb923c', apply:p => p.allies += 1 },
+];
+function pickTwoUpgrades() {
+  const a = UPGRADES[(Math.random() * UPGRADES.length) | 0];
+  let b = a;
+  while (b === a) b = UPGRADES[(Math.random() * UPGRADES.length) | 0];
+  return [a, b];
+}
+
+// ---------- state ----------
+let state = 'menu'; // menu | play | over | win
+let P = null, bullets = [], enemies = [], pairs = [], parts = [], texts = [];
+let meters = 0, boss = null, bossSpawned = false, bossWarned = false;
+let shake = 0, scroll = 0, spawnT = 0, gateT = 0, time = 0, kills = 0, runStart = 0;
+const METERS_GOAL = 300;
+const LINE_Y = H - 150;          // orcs crossing this line hurt you
+
+function startRun() {
+  P = { x:W/2, tx:W/2, y:H-95, hearts:10, dmg:2, fireInt:0.30, shots:1, pierce:0, allies:0, fireT:0, gunLvl:0 };
+  bullets = []; enemies = []; pairs = []; parts = []; texts = [];
+  meters = 0; boss = null; bossSpawned = false; bossWarned = false;
+  shake = 0; scroll = 0; spawnT = 0; gateT = 4; time = 0; kills = 0;
+  runStart = performance.now();
+  state = 'play';
+}
+
+// ---------- spawning ----------
+function difficulty() { return Math.min(1, meters / METERS_GOAL); }
+
+function spawnGrunt(x, y, group) {
+  const t = difficulty();
+  const e = { x, y, r:11, hp:4*(1+2.2*t), speed:42+30*t, kind:'grunt', group:group||null, wob:Math.random()*6.28 };
+  e.maxhp = e.hp; enemies.push(e); return e;
+}
+function spawnBrute(x, y) {
+  const t = difficulty();
+  const e = { x, y, r:17, hp:14*(1+2.2*t), speed:30+20*t, kind:'brute', group:null, wob:Math.random()*6.28 };
+  e.maxhp = e.hp; enemies.push(e); return e;
+}
+function spawnWave() {
+  const t = difficulty();
+  const n = 1 + ((Math.random() * (2 + t * 3)) | 0);
+  for (let i = 0; i < n; i++) {
+    const x = 40 + Math.random() * (W - 80);
+    if (Math.random() < 0.12 + t * 0.15) spawnBrute(x, -20 - Math.random() * 60);
+    else spawnGrunt(x, -20 - Math.random() * 60, null);
+  }
+}
+function spawnGatePair() {
+  const [ua, ub] = pickTwoUpgrades();
+  const pair = { groups: [] };
+  const centers = [W * 0.27, W * 0.73];
+  [ua, ub].forEach((upg, gi) => {
+    const g = { cx: centers[gi], upg, broken:false, rewarded:false, orcs: [] };
+    for (let i = 0; i < 5; i++) {
+      const ox = g.cx + (i % 3 - 1) * 26 + (Math.random() * 8 - 4);
+      const oy = -40 - ((i / 3) | 0) * 30 - Math.random() * 8;
+      g.orcs.push(spawnGrunt(ox, oy, g));
+    }
+    pair.groups.push(g);
+  });
+  pairs.push(pair);
+}
+function spawnBoss() {
+  const e = { x:W/2, y:-70, r:42, hp:750, speed:11, kind:'boss', group:null, wob:0 };
+  e.maxhp = e.hp; enemies.push(e); boss = e; bossSpawned = true;
+  addText(W/2, 260, 'THE WARLORD APPROACHES!', '#f87171', 2.6);
+  beep(90, 0.6, 'sawtooth', 0.12);
+}
+
+// ---------- fx ----------
+function addText(x, y, str, color, life) {
+  texts.push({ x, y, str, color, life: life || 1.4, max: life || 1.4 });
+}
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * 6.28, s = 40 + Math.random() * 140;
+    parts.push({ x, y, vx:Math.cos(a)*s, vy:Math.sin(a)*s, life:0.4+Math.random()*0.3, color });
+  }
+}
+
+// ---------- group / gate logic ----------
+function onEnemyKilled(e) {
+  kills++;
+  meters += e.kind === 'brute' ? 5 : e.kind === 'boss' ? 0 : 2;
+  burst(e.x, e.y, e.kind === 'boss' ? '#f87171' : '#6ee7a0', e.kind === 'grunt' ? 8 : 16);
+  if (e.kind === 'boss') { state = 'win'; beep(660, 0.5, 'square', 0.1); return; }
+  const g = e.group;
+  if (g) {
+    g.orcs = g.orcs.filter(o => o !== e);
+    if (!g.broken && !g.rewarded && g.orcs.length === 0) {
+      g.rewarded = true;
+      g.upg.apply(P);
+      P.gunLvl++;
+      addText(P.x, P.y - 70, g.upg.label + '!', g.upg.color, 1.8);
+      beep(520, 0.15, 'square', 0.08); beep(780, 0.2, 'square', 0.08);
+      // other gate in the pair shatters
+      const pair = pairs.find(pr => pr.groups.includes(g));
+      if (pair) pair.groups.forEach(og => { if (og !== g && !og.rewarded) breakGate(og, false); });
+    }
+  }
+}
+function breakGate(g, silent) {
+  if (g.broken || g.rewarded) return;
+  g.broken = true;
+  g.orcs.forEach(o => o.group = null);
+  if (!silent) {
+    const y = g.orcs.length ? g.orcs[0].y : LINE_Y;
+    addText(g.cx, Math.max(60, y - 30), 'GATE LOST', '#94a3b8', 1.2);
+  }
+}
+function onEnemyLeaked(e) {
+  if (e.group) breakGate(e.group, false);
+  if (e.kind === 'boss') { P.hearts = 0; return; }
+  P.hearts -= e.kind === 'brute' ? 2 : 1;
+  shake = 10;
+  burst(e.x, LINE_Y, '#f87171', 14);
+  beep(120, 0.2, 'sawtooth', 0.1);
+}
+
+// ---------- update ----------
+function update(dt) {
+  time += dt;
+  const t = difficulty();
+
+  // hero movement
+  P.tx = Math.max(24, Math.min(W - 24, pointerX));
+  P.x += (P.tx - P.x) * Math.min(1, dt * 14);
+
+  // firing (hero + allies fire together)
+  P.fireT -= dt;
+  if (P.fireT <= 0) {
+    P.fireT = P.fireInt;
+    const spread = (P.shots - 1) * 7;
+    for (let s = 0; s < P.shots; s++) {
+      const off = P.shots === 1 ? 0 : -spread / 2 + s * 7;
+      bullets.push({ x:P.x + off, y:P.y - 26, vx:off * 1.2, vy:-540, dmg:P.dmg, pierce:P.pierce, ally:false });
+    }
+    for (let a = 0; a < P.allies; a++) {
+      const side = a % 2 === 0 ? -1 : 1;
+      const ax = P.x + side * (34 + 28 * ((a / 2) | 0));
+      bullets.push({ x:ax, y:P.y - 8, vx:0, vy:-500, dmg:P.dmg * 0.4, pierce:0, ally:true });
+    }
+  }
+
+  // bullets
+  for (const b of bullets) { b.x += b.vx * dt; b.y += b.vy * dt; }
+  bullets = bullets.filter(b => b.y > -20 && b.x > -20 && b.x < W + 20 && !b.dead);
+
+  // enemies march
+  for (const e of enemies) {
+    e.wob += dt * 5;
+    e.y += e.speed * dt;
+    e.x += Math.sin(e.wob) * 6 * dt;
+    if (e.y >= LINE_Y && !e.dead) { e.dead = true; onEnemyLeaked(e); }
+  }
+
+  // collisions
+  for (const b of bullets) {
+    for (const e of enemies) {
+      if (e.dead) continue;
+      const dx = b.x - e.x, dy = b.y - e.y;
+      if (dx * dx + dy * dy < (e.r + 4) * (e.r + 4)) {
+        e.hp -= b.dmg;
+        e.flash = 0.06;
+        if (e.hp <= 0) { e.dead = true; onEnemyKilled(e); }
+        if (b.pierce > 0) b.pierce--; else { b.dead = true; break; }
+      }
+    }
+  }
+  enemies = enemies.filter(e => !e.dead);
+  bullets = bullets.filter(b => !b.dead);
+  pairs = pairs.filter(pr => pr.groups.some(g => !g.broken && !g.rewarded && g.orcs.length));
+
+  // spawning
+  if (!bossSpawned) {
+    spawnT -= dt;
+    if (spawnT <= 0) { spawnT = Math.max(0.45, 1.15 - t * 0.7); spawnWave(); }
+    gateT -= dt;
+    if (gateT <= 0) { gateT = 9 + Math.random() * 3; spawnGatePair(); }
+    if (meters >= METERS_GOAL) spawnBoss();
+    else if (meters >= METERS_GOAL * 0.85 && !bossWarned) {
+      bossWarned = true;
+      addText(W/2, 300, 'The horde thins out…', '#e2e8f0', 2);
+    }
+  }
+
+  // fx
+  for (const p of parts) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 300 * dt; p.life -= dt; }
+  parts = parts.filter(p => p.life > 0);
+  for (const ft of texts) { ft.y -= 22 * dt; ft.life -= dt; }
+  texts = texts.filter(ft => ft.life > 0);
+
+  shake = Math.max(0, shake - dt * 30);
+  scroll = (scroll + (30 + t * 30) * dt) % 64;
+
+  if (P.hearts <= 0) { state = 'over'; beep(70, 0.8, 'sawtooth', 0.12); }
+}
+
+// ---------- draw ----------
+function drawOrc(e) {
+  const flash = e.flash > 0;
+  if (e.flash > 0) e.flash -= 1 / 60;
+  // body
+  ctx.fillStyle = flash ? '#ffffff' : (e.kind === 'boss' ? '#b91c1c' : e.kind === 'brute' ? '#65a30d' : '#4d7c0f');
+  ctx.beginPath(); ctx.arc(e.x, e.y, e.r, 0, 6.28); ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,.4)'; ctx.lineWidth = 2; ctx.stroke();
+  // eyes
+  ctx.fillStyle = flash ? '#000' : '#fde047';
+  ctx.beginPath(); ctx.arc(e.x - e.r * 0.35, e.y - e.r * 0.15, e.r * 0.16, 0, 6.28); ctx.fill();
+  ctx.beginPath(); ctx.arc(e.x + e.r * 0.35, e.y - e.r * 0.15, e.r * 0.16, 0, 6.28); ctx.fill();
+  // tusks
+  ctx.fillStyle = '#f8fafc';
+  ctx.fillRect(e.x - e.r * 0.4, e.y + e.r * 0.3, 3, 5);
+  ctx.fillRect(e.x + e.r * 0.4 - 3, e.y + e.r * 0.3, 3, 5);
+  if (e.kind === 'boss') { // crown
+    ctx.fillStyle = '#fbbf24';
+    ctx.beginPath();
+    ctx.moveTo(e.x - 24, e.y - e.r - 2);
+    ctx.lineTo(e.x - 24, e.y - e.r - 18); ctx.lineTo(e.x - 12, e.y - e.r - 6);
+    ctx.lineTo(e.x, e.y - e.r - 20); ctx.lineTo(e.x + 12, e.y - e.r - 6);
+    ctx.lineTo(e.x + 24, e.y - e.r - 18); ctx.lineTo(e.x + 24, e.y - e.r - 2);
+    ctx.closePath(); ctx.fill();
+  }
+  // hp bar for tough ones
+  if (e.maxhp > 6 && e.hp < e.maxhp) {
+    const w = e.r * 2;
+    ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillRect(e.x - w/2, e.y - e.r - 10, w, 4);
+    ctx.fillStyle = '#f87171'; ctx.fillRect(e.x - w/2, e.y - e.r - 10, w * Math.max(0, e.hp / e.maxhp), 4);
+  }
+}
+
+function drawGateBanner(g) {
+  const alive = g.orcs.filter(o => !o.dead);
+  if (!alive.length) return;
+  let minY = 1e9;
+  for (const o of alive) minY = Math.min(minY, o.y);
+  const y = minY - 36;
+  if (y < 10) return;
+  const w = 132, h = 26;
+  ctx.fillStyle = 'rgba(10,12,18,.85)';
+  ctx.fillRect(g.cx - w/2, y - h/2, w, h);
+  ctx.strokeStyle = g.upg.color; ctx.lineWidth = 2;
+  ctx.strokeRect(g.cx - w/2, y - h/2, w, h);
+  ctx.fillStyle = g.upg.color;
+  ctx.font = 'bold 13px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(g.upg.label, g.cx, y);
+  // little chains to the carriers
+  ctx.strokeStyle = 'rgba(148,163,184,.5)'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(g.cx - w/2 + 10, y + h/2); ctx.lineTo(alive[0].x, alive[0].y);
+  ctx.moveTo(g.cx + w/2 - 10, y + h/2); ctx.lineTo(alive[alive.length-1].x, alive[alive.length-1].y);
+  ctx.stroke();
+}
+
+function drawHero() {
+  const lvl = Math.min(6, P.gunLvl);
+  // allies first
+  for (let a = 0; a < P.allies; a++) {
+    const side = a % 2 === 0 ? -1 : 1;
+    const ax = P.x + side * (34 + 28 * ((a / 2) | 0));
+    ctx.fillStyle = '#93c5fd';
+    ctx.beginPath(); ctx.arc(ax, P.y + 4, 9, 0, 6.28); ctx.fill();
+    ctx.fillStyle = '#475569'; ctx.fillRect(ax - 2, P.y - 14, 4, 14);
+  }
+  // hero body
+  ctx.fillStyle = '#e2e8f0';
+  ctx.beginPath(); ctx.arc(P.x, P.y, 15, 0, 6.28); ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth = 2; ctx.stroke();
+  // gun grows with level
+  const gw = 6 + lvl * 2, gl = 26 + lvl * 3;
+  ctx.fillStyle = ['#64748b','#64748b','#0ea5e9','#0ea5e9','#a855f7','#a855f7','#f59e0b'][lvl];
+  ctx.fillRect(P.x - gw/2, P.y - 14 - gl, gw, gl);
+  ctx.fillStyle = '#334155';
+  ctx.fillRect(P.x - gw/2 - 2, P.y - 16, gw + 4, 8);
+}
+
+function drawUI() {
+  // progress to castle
+  const bw = W - 120, bx = 20, by = 24;
+  ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillRect(bx, by, bw, 12);
+  ctx.fillStyle = '#4ade80';
+  ctx.fillRect(bx, by, bw * Math.min(1, meters / METERS_GOAL), 12);
+  ctx.strokeStyle = '#334155'; ctx.strokeRect(bx, by, bw, 12);
+  // castle icon
+  ctx.fillStyle = '#94a3b8';
+  ctx.fillRect(bx + bw + 8, by - 4, 20, 20);
+  ctx.fillRect(bx + bw + 6, by - 8, 4, 6); ctx.fillRect(bx + bw + 16, by - 8, 4, 6); ctx.fillRect(bx + bw + 26, by - 8, 4, 6);
+  ctx.fillStyle = '#e2e8f0'; ctx.font = 'bold 12px monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.fillText('PUSHED ' + (meters | 0) + 'm / ' + METERS_GOAL + 'm', bx, by + 18);
+  // hearts
+  ctx.textAlign = 'right';
+  for (let i = 0; i < 10; i++) {
+    ctx.fillStyle = i < P.hearts ? '#f87171' : 'rgba(255,255,255,.12)';
+    ctx.fillRect(W - 24 - i * 14, by + 20, 10, 10);
+  }
+  ctx.fillStyle = '#94a3b8'; ctx.font = '11px monospace';
+  ctx.fillText('KILLS ' + kills, W - 20, by + 36);
+}
+
+function overlay(title, sub, color) {
+  ctx.fillStyle = 'rgba(6,8,12,.78)'; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = color; ctx.font = 'bold 34px monospace'; ctx.textBaseline = 'middle';
+  ctx.fillText(title, W/2, H/2 - 60);
+  ctx.fillStyle = '#e2e8f0'; ctx.font = '15px monospace';
+  const lines = sub.split('\n');
+  lines.forEach((l, i) => ctx.fillText(l, W/2, H/2 - 10 + i * 24));
+  if ((performance.now() / 500 | 0) % 2 === 0) {
+    ctx.fillStyle = '#4ade80'; ctx.font = 'bold 16px monospace';
+    ctx.fillText('▶ TAP / CLICK TO ' + (state === 'menu' ? 'START' : 'RETRY'), W/2, H/2 + 110);
+  }
+}
+
+function draw() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (shake > 0) ctx.translate((Math.random()-0.5) * shake, (Math.random()-0.5) * shake);
+
+  // ground / scrolling path (world moves toward you)
+  ctx.fillStyle = '#1c2431'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(255,255,255,.03)';
+  for (let y = -64 + scroll; y < H; y += 64) ctx.fillRect(0, y, W, 26);
+  // danger line
+  ctx.strokeStyle = 'rgba(248,113,113,.55)'; ctx.lineWidth = 2;
+  ctx.setLineDash([10, 8]);
+  ctx.beginPath(); ctx.moveTo(0, LINE_Y); ctx.lineTo(W, LINE_Y); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // bullets
+  for (const b of bullets) {
+    ctx.fillStyle = b.ally ? '#93c5fd' : '#fde047';
+    ctx.fillRect(b.x - 2, b.y - 7, 4, 10);
+  }
+  // enemies
+  for (const e of enemies) drawOrc(e);
+  // gate banners
+  for (const pr of pairs) for (const g of pr.groups) if (!g.broken && !g.rewarded) drawGateBanner(g);
+  // hero
+  if (P) drawHero();
+  // particles
+  for (const p of parts) {
+    ctx.globalAlpha = Math.max(0, p.life / 0.6);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+    ctx.globalAlpha = 1;
+  }
+  // floating texts
+  for (const ft of texts) {
+    ctx.globalAlpha = Math.min(1, ft.life / ft.max * 1.6);
+    ctx.fillStyle = ft.color; ctx.font = 'bold 16px monospace';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(ft.str, ft.x, ft.y);
+    ctx.globalAlpha = 1;
+  }
+  if (P) drawUI();
+
+  if (state === 'menu') {
+    overlay('PROTOTYPE 10', 'REVERSE GATE RUNNER\n\nDrag to move — you fire automatically.\nOrc squads carry upgrade gates:\nkill a squad to claim its gate.\nShooting IS choosing.\n\nPush the horde back ' + METERS_GOAL + 'm\nand slay the Warlord.', '#4ade80');
+  } else if (state === 'over') {
+    overlay('OVERRUN', 'The horde broke through.\n\nPushed back: ' + (meters|0) + 'm\nKills: ' + kills, '#f87171');
+  } else if (state === 'win') {
+    overlay('WARLORD SLAIN', 'You pushed the horde back\nto its castle and won!\n\nKills: ' + kills, '#fbbf24');
+  }
+}
+
+// ---------- main loop ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.033, (now - last) / 1000);
+  last = now;
+  if (state === 'play') update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+// draw menu with a dummy P for layout? — keep P null until start; guard in draw().
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
