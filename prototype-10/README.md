@@ -25,4 +25,27 @@ This prototype tests whether the runner-genre appeal survives the inversion:
 3. **Snowball fantasy** → visible weapon evolution + allies joining you.
 4. **Tension** → the approaching wall of orcs is the timer.
 
+## Balance design (the `TUNE` object in index.html)
+
+All balance dials live in one `TUNE` object at the top of the file, each with
+its reasoning attached. The load-bearing rules:
+
+- **Squad HP scales with your current DPS.** Wiping a gate squad always takes
+  ~2.3 seconds of focused fire, no matter how strong you are. The choice must
+  stay "which gate", never "can I even get one".
+- **The corridor widens with your firepower.** With 1 shot you can only defend
+  a narrow strip, so the horde starts marching in the middle 55% of the field
+  and spreads out as you grow.
+- **Pulsed pacing.** A quiet trickle punctuated by labeled surges (first one
+  after 14s) creates a tension rhythm instead of constant noise.
+- **The first gate arrives at 2s** so the core mechanic teaches itself
+  immediately.
+
+## Choice readability
+
+- Gate squads wear a **colored ring** matching their gate's banner.
+- Claiming a gate triggers a short **slow-mo beat**; the banner flies to you.
+- The rejected gate visibly **shatters**: crossed out, tumbling off screen.
+  Its orcs lose their rings and keep marching as regular enemies.
+
 Single self-contained HTML file, no dependencies, no build step.

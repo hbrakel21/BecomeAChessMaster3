@@ -18,6 +18,43 @@ const W = 480, H = 800;
 const cvs = document.getElementById('cvs');
 const ctx = cvs.getContext('2d');
 
+// =====================================================================
+// TUNING — every balance dial lives here, with the reasoning attached.
+// =====================================================================
+const TUNE = {
+  goal: 300,                 // meters to push back before the Warlord (≈3.5–4.5 min run)
+  hero: {
+    dmg: 2,
+    fireInt: 0.26,           // start dps ≈ 7.7 → one loose grunt dies in ~0.5s of focus
+    bulletSpeed: 540,
+    moveLerp: 14,
+  },
+  grunt: { hp:3.5, hpScale:2.0, speed:42, speedScale:30, r:11, meters:2, hearts:1 },
+  brute: { hp:13,  hpScale:2.2, speed:30, speedScale:20, r:17, meters:5, hearts:2 },
+  boss:  { hp:750, speed:12, r:42 },
+  // The horde marches in a corridor that WIDENS as you get stronger.
+  // With 1 shot you can only defend a narrow strip; the field must grow
+  // with your firepower, not start at full width.
+  corridor: { start:0.55, end:1.0 },
+  // Pacing: quiet trickle punctuated by surges → tension rhythm instead of noise.
+  trickle: { startInt:1.4, endInt:0.55, denStart:0.5, denScale:2.5 }, // early ≈1 orc/1.4s
+  surge:   { first:14, every:8, size:3, sizeScale:5 },  // first surge only after 14s
+  gates: {
+    first: 2,                // teach the core mechanic within seconds
+    min: 8, max: 11,         // thereafter a pair every 8–11s
+    squadSize: 5,
+    // KEY RULE: squad HP scales with the player's CURRENT dps so that wiping
+    // a squad always takes ~focusSeconds of focused fire. The choice must
+    // stay "which gate", never "can I even get one".
+    focusSeconds: 2.3,
+    hitEfficiency: 0.7,      // you never land 100% of shots while dodging
+    minOrcHp: 3,
+  },
+  slowmo: { scale:0.25, dur:0.45 },  // claim moment gets a readable beat
+  leakGraceY: 150,           // danger line height above bottom
+};
+const LINE_Y = H - TUNE.leakGraceY;
+
 // ---------- responsive scale ----------
 function fit() {
   const s = Math.min(window.innerWidth / W, window.innerHeight / H) * 0.98;
@@ -63,11 +100,11 @@ window.addEventListener('touchend', () => pressed = false);
 
 // ---------- upgrades ----------
 const UPGRADES = [
-  { key:'dmg',    label:'DAMAGE +50%',  color:'#4ade80', apply:p => p.dmg *= 1.5 },
+  { key:'dmg',    label:'DAMAGE +50%',     color:'#4ade80', apply:p => p.dmg *= 1.5 },
   { key:'rate',   label:'FIRE RATE ×1.35', color:'#facc15', apply:p => p.fireInt = Math.max(0.06, p.fireInt * 0.74) },
-  { key:'multi',  label:'+1 SHOT',      color:'#38bdf8', apply:p => p.shots += 1 },
-  { key:'pierce', label:'PIERCING +1',  color:'#c084fc', apply:p => p.pierce += 1 },
-  { key:'ally',   label:'+1 ALLY',      color:'#fb923c', apply:p => p.allies += 1 },
+  { key:'multi',  label:'+1 SHOT',         color:'#38bdf8', apply:p => p.shots += 1 },
+  { key:'pierce', label:'PIERCING +1',     color:'#c084fc', apply:p => p.pierce += 1 },
+  { key:'ally',   label:'+1 ALLY',         color:'#fb923c', apply:p => p.allies += 1 },
 ];
 function pickTwoUpgrades() {
   const a = UPGRADES[(Math.random() * UPGRADES.length) | 0];
@@ -78,60 +115,91 @@ function pickTwoUpgrades() {
 
 // ---------- state ----------
 let state = 'menu'; // menu | play | over | win
-let P = null, bullets = [], enemies = [], pairs = [], parts = [], texts = [];
+let P = null, bullets = [], enemies = [], pairs = [], parts = [], texts = [], flyers = [];
 let meters = 0, boss = null, bossSpawned = false, bossWarned = false;
-let shake = 0, scroll = 0, spawnT = 0, gateT = 0, time = 0, kills = 0, runStart = 0;
-const METERS_GOAL = 300;
-const LINE_Y = H - 150;          // orcs crossing this line hurt you
+let shake = 0, scroll = 0, trickleT = 0, surgeT = 0, gateT = 0, time = 0, kills = 0;
+let timeScale = 1, slowmoT = 0;
 
 function startRun() {
-  P = { x:W/2, tx:W/2, y:H-95, hearts:10, dmg:2, fireInt:0.30, shots:1, pierce:0, allies:0, fireT:0, gunLvl:0 };
-  bullets = []; enemies = []; pairs = []; parts = []; texts = [];
+  P = { x:W/2, tx:W/2, y:H-95, hearts:10,
+        dmg:TUNE.hero.dmg, fireInt:TUNE.hero.fireInt, shots:1, pierce:0, allies:0,
+        fireT:0, gunLvl:0 };
+  bullets = []; enemies = []; pairs = []; parts = []; texts = []; flyers = [];
   meters = 0; boss = null; bossSpawned = false; bossWarned = false;
-  shake = 0; scroll = 0; spawnT = 0; gateT = 4; time = 0; kills = 0;
-  runStart = performance.now();
+  shake = 0; scroll = 0; trickleT = 0.6; surgeT = TUNE.surge.first;
+  gateT = TUNE.gates.first; time = 0; kills = 0;
+  timeScale = 1; slowmoT = 0;
   state = 'play';
 }
 
-// ---------- spawning ----------
-function difficulty() { return Math.min(1, meters / METERS_GOAL); }
+// ---------- difficulty ----------
+// Mostly meters-driven (progress = danger), with a slow time drip so a
+// stalling player can't farm a frozen difficulty forever.
+function difficulty() { return Math.min(1, meters / TUNE.goal + time / 600); }
 
-function spawnGrunt(x, y, group) {
-  const t = difficulty();
-  const e = { x, y, r:11, hp:4*(1+2.2*t), speed:42+30*t, kind:'grunt', group:group||null, wob:Math.random()*6.28 };
+function playerDps() {
+  return (P.dmg * P.shots + P.dmg * 0.4 * P.allies) / P.fireInt;
+}
+function squadOrcHp() {
+  const total = playerDps() * TUNE.gates.hitEfficiency * TUNE.gates.focusSeconds;
+  return Math.max(TUNE.gates.minOrcHp, total / TUNE.gates.squadSize);
+}
+
+// ---------- spawning ----------
+function spawnGrunt(x, y, group, hpOverride) {
+  const t = difficulty(), c = TUNE.grunt;
+  const e = { x, y, r:c.r, hp:hpOverride || c.hp*(1+c.hpScale*t), speed:c.speed+c.speedScale*t,
+              kind:'grunt', group:group||null, wob:Math.random()*6.28 };
   e.maxhp = e.hp; enemies.push(e); return e;
 }
 function spawnBrute(x, y) {
-  const t = difficulty();
-  const e = { x, y, r:17, hp:14*(1+2.2*t), speed:30+20*t, kind:'brute', group:null, wob:Math.random()*6.28 };
+  const t = difficulty(), c = TUNE.brute;
+  const e = { x, y, r:c.r, hp:c.hp*(1+c.hpScale*t), speed:c.speed+c.speedScale*t,
+              kind:'brute', group:null, wob:Math.random()*6.28 };
   e.maxhp = e.hp; enemies.push(e); return e;
 }
-function spawnWave() {
+function corridorX(frac01) {
   const t = difficulty();
-  const n = 1 + ((Math.random() * (2 + t * 3)) | 0);
+  const cw = (W - 80) * (TUNE.corridor.start + (TUNE.corridor.end - TUNE.corridor.start) * t);
+  return W / 2 + (frac01 - 0.5) * cw;
+}
+function spawnTrickle() {
+  const t = difficulty();
+  const n = 1 + ((Math.random() * (TUNE.trickle.denStart + t * TUNE.trickle.denScale)) | 0);
   for (let i = 0; i < n; i++) {
-    const x = 40 + Math.random() * (W - 80);
-    if (Math.random() < 0.12 + t * 0.15) spawnBrute(x, -20 - Math.random() * 60);
+    const x = corridorX(Math.random());
+    if (Math.random() < 0.10 + t * 0.15) spawnBrute(x, -20 - Math.random() * 60);
     else spawnGrunt(x, -20 - Math.random() * 60, null);
   }
+}
+function spawnSurge() {
+  const t = difficulty();
+  const n = (TUNE.surge.size + t * TUNE.surge.sizeScale) | 0;
+  for (let i = 0; i < n; i++) {
+    const x = corridorX((i + 0.5) / n) + (Math.random() * 20 - 10);
+    spawnGrunt(x, -20 - Math.random() * 40, null);
+  }
+  addText(W/2, 120, 'SURGE!', '#f87171', 1.0);
 }
 function spawnGatePair() {
   const [ua, ub] = pickTwoUpgrades();
   const pair = { groups: [] };
   const centers = [W * 0.27, W * 0.73];
+  const orcHp = squadOrcHp();
   [ua, ub].forEach((upg, gi) => {
     const g = { cx: centers[gi], upg, broken:false, rewarded:false, orcs: [] };
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < TUNE.gates.squadSize; i++) {
       const ox = g.cx + (i % 3 - 1) * 26 + (Math.random() * 8 - 4);
       const oy = -40 - ((i / 3) | 0) * 30 - Math.random() * 8;
-      g.orcs.push(spawnGrunt(ox, oy, g));
+      g.orcs.push(spawnGrunt(ox, oy, g, orcHp));
     }
     pair.groups.push(g);
   });
   pairs.push(pair);
 }
 function spawnBoss() {
-  const e = { x:W/2, y:-70, r:42, hp:750, speed:11, kind:'boss', group:null, wob:0 };
+  const c = TUNE.boss;
+  const e = { x:W/2, y:-70, r:c.r, hp:c.hp, speed:c.speed, kind:'boss', group:null, wob:0 };
   e.maxhp = e.hp; enemies.push(e); boss = e; bossSpawned = true;
   addText(W/2, 260, 'THE WARLORD APPROACHES!', '#f87171', 2.6);
   beep(90, 0.6, 'sawtooth', 0.12);
@@ -147,41 +215,56 @@ function burst(x, y, color, n) {
     parts.push({ x, y, vx:Math.cos(a)*s, vy:Math.sin(a)*s, life:0.4+Math.random()*0.3, color });
   }
 }
+function bannerPos(g) {
+  const alive = g.orcs.filter(o => !o.dead);
+  if (!alive.length) return null;
+  let minY = 1e9;
+  for (const o of alive) minY = Math.min(minY, o.y);
+  return { x: g.cx, y: Math.max(76, minY - 36) };
+}
 
 // ---------- group / gate logic ----------
+function claimGate(g, atX, atY) {
+  g.rewarded = true;
+  g.upg.apply(P);
+  P.gunLvl++;
+  // banner flies to the hero — the "you picked THIS" beat
+  flyers.push({ kind:'claim', x:atX, y:atY, label:g.upg.label, color:g.upg.color, t:0 });
+  burst(atX, atY, g.upg.color, 20);
+  timeScale = TUNE.slowmo.scale; slowmoT = TUNE.slowmo.dur;
+  beep(520, 0.15, 'square', 0.08); beep(780, 0.2, 'square', 0.08);
+  // the other gate in the pair visibly shatters
+  const pair = pairs.find(pr => pr.groups.includes(g));
+  if (pair) pair.groups.forEach(og => { if (og !== g && !og.rewarded) breakGate(og, 'rejected'); });
+}
+function breakGate(g, reason) {
+  if (g.broken || g.rewarded) return;
+  g.broken = true;
+  const pos = bannerPos(g) || { x:g.cx, y:LINE_Y - 60 };
+  g.orcs.forEach(o => o.group = null);
+  // banner falls off screen with a cross through it — you SEE it break
+  flyers.push({ kind:'break', x:pos.x, y:pos.y, label:g.upg.label, color:g.upg.color,
+                t:0, vx:(Math.random()*60-30), vy:-60, rot:0, vr:(Math.random()<0.5?-1:1)*(2+Math.random()*2) });
+  burst(pos.x, pos.y, '#94a3b8', 10);
+  if (reason === 'leaked') addText(pos.x, pos.y - 20, 'GATE LOST', '#94a3b8', 1.2);
+  beep(200, 0.12, 'sawtooth', 0.05);
+}
 function onEnemyKilled(e) {
   kills++;
-  meters += e.kind === 'brute' ? 5 : e.kind === 'boss' ? 0 : 2;
+  const c = TUNE[e.kind];
+  if (c) meters += c.meters || 0;
   burst(e.x, e.y, e.kind === 'boss' ? '#f87171' : '#6ee7a0', e.kind === 'grunt' ? 8 : 16);
   if (e.kind === 'boss') { state = 'win'; beep(660, 0.5, 'square', 0.1); return; }
   const g = e.group;
   if (g) {
     g.orcs = g.orcs.filter(o => o !== e);
-    if (!g.broken && !g.rewarded && g.orcs.length === 0) {
-      g.rewarded = true;
-      g.upg.apply(P);
-      P.gunLvl++;
-      addText(P.x, P.y - 70, g.upg.label + '!', g.upg.color, 1.8);
-      beep(520, 0.15, 'square', 0.08); beep(780, 0.2, 'square', 0.08);
-      // other gate in the pair shatters
-      const pair = pairs.find(pr => pr.groups.includes(g));
-      if (pair) pair.groups.forEach(og => { if (og !== g && !og.rewarded) breakGate(og, false); });
-    }
-  }
-}
-function breakGate(g, silent) {
-  if (g.broken || g.rewarded) return;
-  g.broken = true;
-  g.orcs.forEach(o => o.group = null);
-  if (!silent) {
-    const y = g.orcs.length ? g.orcs[0].y : LINE_Y;
-    addText(g.cx, Math.max(60, y - 30), 'GATE LOST', '#94a3b8', 1.2);
+    if (!g.broken && !g.rewarded && g.orcs.length === 0) claimGate(g, e.x, e.y);
   }
 }
 function onEnemyLeaked(e) {
-  if (e.group) breakGate(e.group, false);
+  if (e.group) breakGate(e.group, 'leaked');
   if (e.kind === 'boss') { P.hearts = 0; return; }
-  P.hearts -= e.kind === 'brute' ? 2 : 1;
+  P.hearts -= TUNE[e.kind].hearts;
   shake = 10;
   burst(e.x, LINE_Y, '#f87171', 14);
   beep(120, 0.2, 'sawtooth', 0.1);
@@ -194,7 +277,7 @@ function update(dt) {
 
   // hero movement
   P.tx = Math.max(24, Math.min(W - 24, pointerX));
-  P.x += (P.tx - P.x) * Math.min(1, dt * 14);
+  P.x += (P.tx - P.x) * Math.min(1, dt * TUNE.hero.moveLerp);
 
   // firing (hero + allies fire together)
   P.fireT -= dt;
@@ -203,7 +286,7 @@ function update(dt) {
     const spread = (P.shots - 1) * 7;
     for (let s = 0; s < P.shots; s++) {
       const off = P.shots === 1 ? 0 : -spread / 2 + s * 7;
-      bullets.push({ x:P.x + off, y:P.y - 26, vx:off * 1.2, vy:-540, dmg:P.dmg, pierce:P.pierce, ally:false });
+      bullets.push({ x:P.x + off, y:P.y - 26, vx:off * 1.2, vy:-TUNE.hero.bulletSpeed, dmg:P.dmg, pierce:P.pierce, ally:false });
     }
     for (let a = 0; a < P.allies; a++) {
       const side = a % 2 === 0 ? -1 : 1;
@@ -243,12 +326,20 @@ function update(dt) {
 
   // spawning
   if (!bossSpawned) {
-    spawnT -= dt;
-    if (spawnT <= 0) { spawnT = Math.max(0.45, 1.15 - t * 0.7); spawnWave(); }
+    trickleT -= dt;
+    if (trickleT <= 0) {
+      trickleT = TUNE.trickle.startInt + (TUNE.trickle.endInt - TUNE.trickle.startInt) * t;
+      spawnTrickle();
+    }
+    surgeT -= dt;
+    if (surgeT <= 0) { surgeT = TUNE.surge.every; spawnSurge(); }
     gateT -= dt;
-    if (gateT <= 0) { gateT = 9 + Math.random() * 3; spawnGatePair(); }
-    if (meters >= METERS_GOAL) spawnBoss();
-    else if (meters >= METERS_GOAL * 0.85 && !bossWarned) {
+    if (gateT <= 0) {
+      gateT = TUNE.gates.min + Math.random() * (TUNE.gates.max - TUNE.gates.min);
+      spawnGatePair();
+    }
+    if (meters >= TUNE.goal) spawnBoss();
+    else if (meters >= TUNE.goal * 0.85 && !bossWarned) {
       bossWarned = true;
       addText(W/2, 300, 'The horde thins out…', '#e2e8f0', 2);
     }
@@ -259,6 +350,18 @@ function update(dt) {
   parts = parts.filter(p => p.life > 0);
   for (const ft of texts) { ft.y -= 22 * dt; ft.life -= dt; }
   texts = texts.filter(ft => ft.life > 0);
+  for (const f of flyers) {
+    f.t += dt;
+    if (f.kind === 'claim') {
+      f.x += (P.x - f.x) * Math.min(1, dt * 9);
+      f.y += (P.y - 70 - f.y) * Math.min(1, dt * 9);
+      if (f.t > 0.55) { f.dead = true; addText(P.x, P.y - 70, f.label + '!', f.color, 1.6); }
+    } else {
+      f.vy += 500 * dt; f.x += f.vx * dt; f.y += f.vy * dt; f.rot += f.vr * dt;
+      if (f.t > 1.3) f.dead = true;
+    }
+  }
+  flyers = flyers.filter(f => !f.dead);
 
   shake = Math.max(0, shake - dt * 30);
   scroll = (scroll + (30 + t * 30) * dt) % 64;
@@ -270,19 +373,21 @@ function update(dt) {
 function drawOrc(e) {
   const flash = e.flash > 0;
   if (e.flash > 0) e.flash -= 1 / 60;
-  // body
+  // squad ring in its gate's color — you see WHICH squad carries WHICH gate
+  if (e.group && !e.group.broken && !e.group.rewarded) {
+    ctx.strokeStyle = e.group.upg.color; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.arc(e.x, e.y, e.r + 4, 0, 6.28); ctx.stroke();
+  }
   ctx.fillStyle = flash ? '#ffffff' : (e.kind === 'boss' ? '#b91c1c' : e.kind === 'brute' ? '#65a30d' : '#4d7c0f');
   ctx.beginPath(); ctx.arc(e.x, e.y, e.r, 0, 6.28); ctx.fill();
   ctx.strokeStyle = 'rgba(0,0,0,.4)'; ctx.lineWidth = 2; ctx.stroke();
-  // eyes
   ctx.fillStyle = flash ? '#000' : '#fde047';
   ctx.beginPath(); ctx.arc(e.x - e.r * 0.35, e.y - e.r * 0.15, e.r * 0.16, 0, 6.28); ctx.fill();
   ctx.beginPath(); ctx.arc(e.x + e.r * 0.35, e.y - e.r * 0.15, e.r * 0.16, 0, 6.28); ctx.fill();
-  // tusks
   ctx.fillStyle = '#f8fafc';
   ctx.fillRect(e.x - e.r * 0.4, e.y + e.r * 0.3, 3, 5);
   ctx.fillRect(e.x + e.r * 0.4 - 3, e.y + e.r * 0.3, 3, 5);
-  if (e.kind === 'boss') { // crown
+  if (e.kind === 'boss') {
     ctx.fillStyle = '#fbbf24';
     ctx.beginPath();
     ctx.moveTo(e.x - 24, e.y - e.r - 2);
@@ -291,7 +396,6 @@ function drawOrc(e) {
     ctx.lineTo(e.x + 24, e.y - e.r - 18); ctx.lineTo(e.x + 24, e.y - e.r - 2);
     ctx.closePath(); ctx.fill();
   }
-  // hp bar for tough ones
   if (e.maxhp > 6 && e.hp < e.maxhp) {
     const w = e.r * 2;
     ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillRect(e.x - w/2, e.y - e.r - 10, w, 4);
@@ -299,31 +403,46 @@ function drawOrc(e) {
   }
 }
 
-function drawGateBanner(g) {
-  const alive = g.orcs.filter(o => !o.dead);
-  if (!alive.length) return;
-  let minY = 1e9;
-  for (const o of alive) minY = Math.min(minY, o.y);
-  const y = minY - 36;
-  if (y < 10) return;
+function drawBanner(x, y, label, color, opts) {
   const w = 132, h = 26;
-  ctx.fillStyle = 'rgba(10,12,18,.85)';
-  ctx.fillRect(g.cx - w/2, y - h/2, w, h);
-  ctx.strokeStyle = g.upg.color; ctx.lineWidth = 2;
-  ctx.strokeRect(g.cx - w/2, y - h/2, w, h);
-  ctx.fillStyle = g.upg.color;
+  const scale = (opts && opts.scale) || 1;
+  const rot = (opts && opts.rot) || 0;
+  const alpha = (opts && opts.alpha != null) ? opts.alpha : 1;
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(rot); ctx.scale(scale, scale);
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = 'rgba(10,12,18,.88)';
+  ctx.fillRect(-w/2, -h/2, w, h);
+  ctx.strokeStyle = color; ctx.lineWidth = 2;
+  ctx.strokeRect(-w/2, -h/2, w, h);
+  ctx.fillStyle = color;
   ctx.font = 'bold 13px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.fillText(g.upg.label, g.cx, y);
-  // little chains to the carriers
+  ctx.fillText(label, 0, 0);
+  if (opts && opts.crossed) {
+    ctx.strokeStyle = '#f87171'; ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(-w/2 + 6, -h/2 + 4); ctx.lineTo(w/2 - 6, h/2 - 4);
+    ctx.moveTo(w/2 - 6, -h/2 + 4); ctx.lineTo(-w/2 + 6, h/2 - 4);
+    ctx.stroke();
+  }
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+function drawGateBanner(g) {
+  const pos = bannerPos(g);
+  if (!pos || pos.y < 10) return;
+  drawBanner(pos.x, pos.y, g.upg.label, g.upg.color);
+  const alive = g.orcs.filter(o => !o.dead);
   ctx.strokeStyle = 'rgba(148,163,184,.5)'; ctx.lineWidth = 1;
-  ctx.beginPath(); ctx.moveTo(g.cx - w/2 + 10, y + h/2); ctx.lineTo(alive[0].x, alive[0].y);
-  ctx.moveTo(g.cx + w/2 - 10, y + h/2); ctx.lineTo(alive[alive.length-1].x, alive[alive.length-1].y);
+  ctx.beginPath();
+  ctx.moveTo(pos.x - 56, pos.y + 13); ctx.lineTo(alive[0].x, alive[0].y);
+  ctx.moveTo(pos.x + 56, pos.y + 13); ctx.lineTo(alive[alive.length-1].x, alive[alive.length-1].y);
   ctx.stroke();
 }
 
 function drawHero() {
   const lvl = Math.min(6, P.gunLvl);
-  // allies first
   for (let a = 0; a < P.allies; a++) {
     const side = a % 2 === 0 ? -1 : 1;
     const ax = P.x + side * (34 + 28 * ((a / 2) | 0));
@@ -331,11 +450,9 @@ function drawHero() {
     ctx.beginPath(); ctx.arc(ax, P.y + 4, 9, 0, 6.28); ctx.fill();
     ctx.fillStyle = '#475569'; ctx.fillRect(ax - 2, P.y - 14, 4, 14);
   }
-  // hero body
   ctx.fillStyle = '#e2e8f0';
   ctx.beginPath(); ctx.arc(P.x, P.y, 15, 0, 6.28); ctx.fill();
   ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth = 2; ctx.stroke();
-  // gun grows with level
   const gw = 6 + lvl * 2, gl = 26 + lvl * 3;
   ctx.fillStyle = ['#64748b','#64748b','#0ea5e9','#0ea5e9','#a855f7','#a855f7','#f59e0b'][lvl];
   ctx.fillRect(P.x - gw/2, P.y - 14 - gl, gw, gl);
@@ -344,19 +461,16 @@ function drawHero() {
 }
 
 function drawUI() {
-  // progress to castle
   const bw = W - 120, bx = 20, by = 24;
   ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillRect(bx, by, bw, 12);
   ctx.fillStyle = '#4ade80';
-  ctx.fillRect(bx, by, bw * Math.min(1, meters / METERS_GOAL), 12);
+  ctx.fillRect(bx, by, bw * Math.min(1, meters / TUNE.goal), 12);
   ctx.strokeStyle = '#334155'; ctx.strokeRect(bx, by, bw, 12);
-  // castle icon
   ctx.fillStyle = '#94a3b8';
   ctx.fillRect(bx + bw + 8, by - 4, 20, 20);
   ctx.fillRect(bx + bw + 6, by - 8, 4, 6); ctx.fillRect(bx + bw + 16, by - 8, 4, 6); ctx.fillRect(bx + bw + 26, by - 8, 4, 6);
   ctx.fillStyle = '#e2e8f0'; ctx.font = 'bold 12px monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
-  ctx.fillText('PUSHED ' + (meters | 0) + 'm / ' + METERS_GOAL + 'm', bx, by + 18);
-  // hearts
+  ctx.fillText('PUSHED ' + (meters | 0) + 'm / ' + TUNE.goal + 'm', bx, by + 18);
   ctx.textAlign = 'right';
   for (let i = 0; i < 10; i++) {
     ctx.fillStyle = i < P.hearts ? '#f87171' : 'rgba(255,255,255,.12)';
@@ -384,35 +498,32 @@ function draw() {
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   if (shake > 0) ctx.translate((Math.random()-0.5) * shake, (Math.random()-0.5) * shake);
 
-  // ground / scrolling path (world moves toward you)
   ctx.fillStyle = '#1c2431'; ctx.fillRect(0, 0, W, H);
   ctx.fillStyle = 'rgba(255,255,255,.03)';
   for (let y = -64 + scroll; y < H; y += 64) ctx.fillRect(0, y, W, 26);
-  // danger line
   ctx.strokeStyle = 'rgba(248,113,113,.55)'; ctx.lineWidth = 2;
   ctx.setLineDash([10, 8]);
   ctx.beginPath(); ctx.moveTo(0, LINE_Y); ctx.lineTo(W, LINE_Y); ctx.stroke();
   ctx.setLineDash([]);
 
-  // bullets
   for (const b of bullets) {
     ctx.fillStyle = b.ally ? '#93c5fd' : '#fde047';
     ctx.fillRect(b.x - 2, b.y - 7, 4, 10);
   }
-  // enemies
   for (const e of enemies) drawOrc(e);
-  // gate banners
-  for (const pr of pairs) for (const g of pr.groups) if (!g.broken && !g.rewarded) drawGateBanner(g);
-  // hero
+  for (const pr of pairs) for (const g of pr.groups) if (!g.broken && !g.rewarded && g.orcs.length) drawGateBanner(g);
   if (P) drawHero();
-  // particles
   for (const p of parts) {
     ctx.globalAlpha = Math.max(0, p.life / 0.6);
     ctx.fillStyle = p.color;
     ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
     ctx.globalAlpha = 1;
   }
-  // floating texts
+  // flying / breaking banners on top — the choice moment must be unmissable
+  for (const f of flyers) {
+    if (f.kind === 'claim') drawBanner(f.x, f.y, f.label, f.color, { scale: 1 + f.t * 0.7 });
+    else drawBanner(f.x, f.y, f.label, '#64748b', { rot: f.rot, alpha: Math.max(0, 1 - f.t / 1.3), crossed: true });
+  }
   for (const ft of texts) {
     ctx.globalAlpha = Math.min(1, ft.life / ft.max * 1.6);
     ctx.fillStyle = ft.color; ctx.font = 'bold 16px monospace';
@@ -422,8 +533,14 @@ function draw() {
   }
   if (P) drawUI();
 
+  // slow-mo vignette
+  if (timeScale < 1) {
+    ctx.fillStyle = 'rgba(56,189,248,.06)';
+    ctx.fillRect(0, 0, W, H);
+  }
+
   if (state === 'menu') {
-    overlay('PROTOTYPE 10', 'REVERSE GATE RUNNER\n\nDrag to move — you fire automatically.\nOrc squads carry upgrade gates:\nkill a squad to claim its gate.\nShooting IS choosing.\n\nPush the horde back ' + METERS_GOAL + 'm\nand slay the Warlord.', '#4ade80');
+    overlay('PROTOTYPE 10', 'REVERSE GATE RUNNER\n\nDrag to move — you fire automatically.\nOrc squads with colored rings\ncarry upgrade gates:\nwipe a squad to claim its gate.\nShooting IS choosing.\n\nPush the horde back ' + TUNE.goal + 'm\nand slay the Warlord.', '#4ade80');
   } else if (state === 'over') {
     overlay('OVERRUN', 'The horde broke through.\n\nPushed back: ' + (meters|0) + 'm\nKills: ' + kills, '#f87171');
   } else if (state === 'win') {
@@ -436,11 +553,14 @@ let last = performance.now();
 function frame(now) {
   const dt = Math.min(0.033, (now - last) / 1000);
   last = now;
-  if (state === 'play') update(dt);
+  if (state === 'play') {
+    slowmoT -= dt;
+    if (slowmoT <= 0) timeScale = 1;
+    update(dt * timeScale);
+  }
   draw();
   requestAnimationFrame(frame);
 }
-// draw menu with a dummy P for layout? — keep P null until start; guard in draw().
 requestAnimationFrame(frame);
 </script>
 </body>
