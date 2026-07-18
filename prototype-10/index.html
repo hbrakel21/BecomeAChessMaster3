@@ -28,7 +28,6 @@ const TUNE = {
     fireInt: 0.26,           // start dps ≈ 7.7 → one loose grunt dies in ~0.5s of focus
     bulletSpeed: 540,
     moveLerp: 30,            // near-instant follow — sluggish controls kill fast decisions
-    dragSense: 1.7,          // touch: hero moves 1.7× your finger delta (finger never covers hero)
   },
   grunt: { hp:3.5, hpScale:2.0, speed:42, speedScale:30, r:11, meters:2, hearts:1 },
   brute: { hp:13,  hpScale:2.2, speed:30, speedScale:20, r:17, meters:5, hearts:2 },
@@ -86,13 +85,13 @@ function beep(freq, dur, type, vol) {
 }
 
 // ---------- input ----------
-// Pointer events with capture, so one gesture keeps flowing no matter where
-// the pointer goes. Touch/pen: RELATIVE drag — finger anywhere, hero moves by
-// the amplified delta. Mouse: hero follows the cursor x directly.
-// targetX is clamped IN THE HANDLER: it must never accumulate past the field
-// edge, or reversing direction would first have to "drag back" invisible
-// overshoot before the hero responds.
-let targetX = W / 2, dragLast = null, dragId = null;
+// STATELESS absolute control. Every event alone fully determines the hero's
+// target: the hero goes where your finger/cursor IS. No drag deltas, no
+// stored gesture state, no pointer ids — because any stateful scheme lets a
+// single lost/cancelled/reordered event poison the rest of the gesture.
+// Here, whatever event arrives — in any order, after any interruption —
+// positions the hero correctly. Direction cannot matter by construction.
+let targetX = W / 2;
 const clampX = x => Math.max(24, Math.min(W - 24, x));
 function toGameX(clientX) {
   const r = cvs.getBoundingClientRect();
@@ -101,43 +100,46 @@ function toGameX(clientX) {
 function ensureAudio() {
   if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (err) {} }
 }
+// input diagnostics: event counters shown tiny in the corner. If the "m"
+// counter freezes while your finger is moving, the embedding environment is
+// eating the events — that is then provably not a game bug.
+const inStats = { d:0, m:0, u:0, c:0, t:0, lastX:0 };
+function steer(e) {
+  inStats.lastX = targetX = clampX(toGameX(e.clientX));
+}
 cvs.addEventListener('pointerdown', e => {
   ensureAudio();
   if (state !== 'play') startRun();
-  dragId = e.pointerId;
-  dragLast = toGameX(e.clientX);
-  if (e.pointerType === 'mouse') targetX = clampX(dragLast);
+  inStats.d++;
+  steer(e);
   try { cvs.setPointerCapture(e.pointerId); } catch (err) {}
   e.preventDefault();
 });
 cvs.addEventListener('pointermove', e => {
+  inStats.m++;
   if (state !== 'play') return;
-  const x = toGameX(e.clientX);
-  if (e.pointerType === 'mouse') { targetX = clampX(x); return; }
-  // If the container fired a pointercancel mid-gesture (swipe hijack) and
-  // events resume, RE-SEED the drag instead of ignoring the rest of the
-  // gesture — the finger never left the screen, so the drag must survive.
-  if (e.pointerId !== dragId || dragLast == null) {
-    dragId = e.pointerId; dragLast = x;
-    e.preventDefault();
-    return;
-  }
-  targetX = clampX(targetX + (x - dragLast) * TUNE.hero.dragSense);
-  dragLast = x;
+  steer(e);
   e.preventDefault();
 });
-function endDrag(e) {
-  if (e.pointerId === dragId) { dragId = null; dragLast = null; }
-}
-cvs.addEventListener('pointerup', endDrag);
-cvs.addEventListener('pointercancel', endDrag);
-// iOS/WebView hardening: gesture hijacking (swipe-back, panel swipes) can
-// only be blocked on the RAW touch events — preventDefault on pointer
-// events does nothing for that on iOS. These handlers do no logic; they
-// exist purely to keep the container's hands off horizontal swipes.
-for (const t of ['touchstart', 'touchmove', 'touchend']) {
-  cvs.addEventListener(t, e => { e.preventDefault(); e.stopPropagation(); }, { passive:false });
-}
+cvs.addEventListener('pointerup', e => inStats.u++);
+cvs.addEventListener('pointercancel', e => inStats.c++);
+// Raw touch events as a REDUNDANT input path: if the environment delivers
+// touch events but suppresses pointer events (or vice versa), steering still
+// works. Also preventDefault here is the only thing iOS respects for
+// blocking container gestures (swipe-back, panel swipes).
+cvs.addEventListener('touchstart', e => {
+  ensureAudio();
+  if (state !== 'play') startRun();
+  inStats.t++;
+  if (e.touches[0]) { inStats.lastX = targetX = clampX(toGameX(e.touches[0].clientX)); }
+  e.preventDefault(); e.stopPropagation();
+}, { passive:false });
+cvs.addEventListener('touchmove', e => {
+  inStats.t++;
+  if (e.touches[0]) { inStats.lastX = targetX = clampX(toGameX(e.touches[0].clientX)); }
+  e.preventDefault(); e.stopPropagation();
+}, { passive:false });
+cvs.addEventListener('touchend', e => { e.preventDefault(); e.stopPropagation(); }, { passive:false });
 
 // ---------- upgrades (bronze / silver / gold effects per tier) ----------
 const UPGRADES = [
@@ -181,7 +183,7 @@ function startRun() {
   meters = 0; boss = null; bossSpawned = false; bossWarned = false;
   shake = 0; scroll = 0; trickleT = 0.6; surgeT = TUNE.surge.first;
   gateT = TUNE.gates.first; time = 0; kills = 0;
-  timeScale = 1; slowmoT = 0; targetX = W / 2; dragLast = null;
+  timeScale = 1; slowmoT = 0; targetX = W / 2;
   state = 'play';
 }
 
@@ -557,6 +559,10 @@ function drawUI() {
   }
   ctx.fillStyle = '#94a3b8'; ctx.font = '11px monospace';
   ctx.fillText('KILLS ' + kills, W - 20, by + 36);
+  // input diagnostics (tiny): d=downs m=moves u=ups c=cancels t=touch evts
+  ctx.textAlign = 'left'; ctx.font = '9px monospace';
+  ctx.fillStyle = 'rgba(148,163,184,.45)';
+  ctx.fillText('in d' + inStats.d + ' m' + inStats.m + ' u' + inStats.u + ' c' + inStats.c + ' t' + inStats.t + ' x' + (inStats.lastX|0), 8, H - 14);
 }
 
 function overlay(title, sub, color) {
