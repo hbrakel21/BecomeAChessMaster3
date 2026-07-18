@@ -23,22 +23,35 @@ const ctx = cvs.getContext('2d');
 // =====================================================================
 const TUNE = {
   goal: 300,                 // meters to push back before the Warlord (≈3.5–4.5 min run)
+  // SATISFACTION RULE: fun in this genre = feedback density × power fantasy.
+  // Many weak enemies mowed constantly beats few "fair" enemies killed
+  // occasionally. Base grunts die to ONE bullet; volume brings difficulty.
   hero: {
-    dmg: 2,
-    fireInt: 0.26,           // start dps ≈ 7.7 → one loose grunt dies in ~0.5s of focus
-    bulletSpeed: 540,
+    dmg: 1.3,
+    fireInt: 0.15,           // fast stream — the gun must FEEL like a hose
+    bulletSpeed: 560,
     moveLerp: 30,            // near-instant follow — sluggish controls kill fast decisions
   },
-  grunt: { hp:3.5, hpScale:2.0, speed:42, speedScale:30, r:11, meters:2, hearts:1 },
-  brute: { hp:13,  hpScale:2.2, speed:30, speedScale:20, r:17, meters:5, hearts:2 },
-  boss:  { hp:750, speed:12, r:42 },
+  grunt: { hp:1.2, hpScale:1.8, speed:46, speedScale:26, r:11, meters:1, hearts:1 },
+  brute: { hp:10,  hpScale:2.2, speed:30, speedScale:20, r:17, meters:4, hearts:2 },
+  boss:  { hp:600, speed:12, r:42 },
+  // Physical feedback: every bullet SHOVES its victim back (the tug-of-war,
+  // felt per hit), kills chain into a combo that pays out extra meters, and
+  // big kills freeze the frame for a beat.
+  feel: {
+    knockback: 13,           // px shoved per bullet hit (boss barely budges)
+    hitstop: 0.07,           // seconds of near-freeze on brute kills
+    comboWindow: 1.1,        // kills within this window chain
+    comboMinPayout: 8,       // combos this size pay bonus push meters
+    killPulse: 70,           // world-scroll surge per kill (mowing = momentum)
+  },
   // The horde marches in a corridor that WIDENS as you get stronger.
   // With 1 shot you can only defend a narrow strip; the field must grow
   // with your firepower, not start at full width.
   corridor: { start:0.55, end:1.0 },
-  // Pacing: quiet trickle punctuated by surges → tension rhythm instead of noise.
-  trickle: { startInt:1.4, endInt:0.55, denStart:0.5, denScale:2.5 }, // early ≈1 orc/1.4s
-  surge:   { first:14, every:8, size:3, sizeScale:5 },  // first surge only after 14s
+  // Pacing: a dense stream punctuated by surges → constant mowing, spikes of chaos.
+  trickle: { startInt:0.55, endInt:0.32, denStart:1.2, denScale:2.5 },
+  surge:   { first:12, every:7, size:8, sizeScale:8 },
   gates: {
     first: 2,                // teach the core mechanic within seconds
     min: 8, max: 11,         // thereafter a pair every 8–11s
@@ -174,6 +187,7 @@ let P = null, bullets = [], enemies = [], pairs = [], parts = [], texts = [], fl
 let meters = 0, boss = null, bossSpawned = false, bossWarned = false;
 let shake = 0, scroll = 0, trickleT = 0, surgeT = 0, gateT = 0, time = 0, kills = 0;
 let timeScale = 1, slowmoT = 0;
+let combo = 0, comboT = 0, killPulse = 0;
 
 function startRun() {
   P = { x:W/2, tx:W/2, y:H-95, hearts:10,
@@ -184,6 +198,7 @@ function startRun() {
   shake = 0; scroll = 0; trickleT = 0.6; surgeT = TUNE.surge.first;
   gateT = TUNE.gates.first; time = 0; kills = 0;
   timeScale = 1; slowmoT = 0; targetX = W / 2;
+  combo = 0; comboT = 0; killPulse = 0;
   state = 'play';
 }
 
@@ -219,6 +234,7 @@ function corridorX(frac01) {
   return W / 2 + (frac01 - 0.5) * cw;
 }
 function spawnTrickle() {
+  if (enemies.length > 160) return;
   const t = difficulty();
   const n = 1 + ((Math.random() * (TUNE.trickle.denStart + t * TUNE.trickle.denScale)) | 0);
   for (let i = 0; i < n; i++) {
@@ -228,6 +244,7 @@ function spawnTrickle() {
   }
 }
 function spawnSurge() {
+  if (enemies.length > 160) return;
   const t = difficulty();
   const n = (TUNE.surge.size + t * TUNE.surge.sizeScale) | 0;
   for (let i = 0; i < n; i++) {
@@ -308,8 +325,17 @@ function onEnemyKilled(e) {
   kills++;
   const c = TUNE[e.kind];
   if (c) meters += c.meters || 0;
-  burst(e.x, e.y, e.kind === 'boss' ? '#f87171' : '#6ee7a0', e.kind === 'grunt' ? 8 : 16);
+  burst(e.x, e.y, e.kind === 'boss' ? '#f87171' : '#6ee7a0', e.kind === 'grunt' ? 14 : 26);
+  burst(e.x, e.y, '#365314', 6);
   if (e.kind === 'boss') { state = 'win'; beep(660, 0.5, 'square', 0.1); return; }
+  // combo: chained kills escalate in pitch and pay out push meters
+  combo++; comboT = TUNE.feel.comboWindow;
+  beep(240 + Math.min(combo, 24) * 35, 0.05, 'square', 0.035);
+  killPulse = Math.min(180, killPulse + TUNE.feel.killPulse);
+  if (e.kind === 'brute') {          // hit-stop: big kills land with weight
+    timeScale = 0.1; slowmoT = TUNE.feel.hitstop;
+    shake = Math.max(shake, 5);
+  }
   const g = e.group;
   if (g) {
     g.orcs = g.orcs.filter(o => o !== e);
@@ -338,6 +364,7 @@ function update(dt) {
   P.fireT -= dt;
   if (P.fireT <= 0) {
     P.fireT = P.fireInt;
+    P.muzzle = 0.05;
     const spread = (P.shots - 1) * 7;
     for (let s = 0; s < P.shots; s++) {
       const off = P.shots === 1 ? 0 : -spread / 2 + s * 7;
@@ -370,6 +397,8 @@ function update(dt) {
       if (dx * dx + dy * dy < (e.r + 4) * (e.r + 4)) {
         e.hp -= b.dmg;
         e.flash = 0.06;
+        // every bullet physically SHOVES the horde back — tug-of-war per hit
+        e.y -= e.kind === 'boss' ? 1.5 : TUNE.feel.knockback;
         if (e.hp <= 0) { e.dead = true; onEnemyKilled(e); }
         if (b.pierce > 0) b.pierce--; else { b.dead = true; break; }
       }
@@ -437,8 +466,23 @@ function update(dt) {
   }
   flyers = flyers.filter(f => !f.dead);
 
+  // combo bookkeeping: window closes → big chains pay out extra push
+  if (comboT > 0) {
+    comboT -= dt;
+    if (comboT <= 0 && combo > 0) {
+      if (combo >= TUNE.feel.comboMinPayout) {
+        const bonus = Math.round(combo / 2);
+        meters += bonus;
+        addText(P.x, P.y - 90, 'COMBO ×' + combo + '  PUSH +' + bonus + 'm!', '#fbbf24', 1.6);
+        beep(880, 0.18, 'square', 0.07);
+      }
+      combo = 0;
+    }
+  }
+  if (P.muzzle > 0) P.muzzle -= dt;
+  killPulse = Math.max(0, killPulse - dt * 220);
   shake = Math.max(0, shake - dt * 30);
-  scroll = (scroll + (30 + t * 30) * dt) % 64;
+  scroll = (scroll + (30 + t * 30 + killPulse) * dt) % 64;
 
   if (P.hearts <= 0) { state = 'over'; beep(70, 0.8, 'sawtooth', 0.12); }
 }
@@ -539,6 +583,14 @@ function drawHero() {
   ctx.fillRect(P.x - gw/2, P.y - 14 - gl, gw, gl);
   ctx.fillStyle = '#334155';
   ctx.fillRect(P.x - gw/2 - 2, P.y - 16, gw + 4, 8);
+  // muzzle flash: the gun visibly SPITS
+  if (P.muzzle > 0) {
+    const my = P.y - 14 - gl;
+    ctx.fillStyle = 'rgba(255,240,150,.9)';
+    ctx.beginPath();
+    ctx.arc(P.x, my - 4, 5 + Math.random() * 3, 0, 6.28);
+    ctx.fill();
+  }
 }
 
 function drawUI() {
@@ -559,6 +611,14 @@ function drawUI() {
   }
   ctx.fillStyle = '#94a3b8'; ctx.font = '11px monospace';
   ctx.fillText('KILLS ' + kills, W - 20, by + 36);
+  // combo counter: grows and glows while the chain lives
+  if (combo >= 4 && comboT > 0) {
+    const pulse = 1 + Math.min(combo, 30) * 0.02 + comboT * 0.15;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.font = 'bold ' + ((22 * pulse) | 0) + 'px monospace';
+    ctx.fillStyle = combo >= TUNE.feel.comboMinPayout ? '#fbbf24' : '#e2e8f0';
+    ctx.fillText('×' + combo, W / 2, 92);
+  }
   // input diagnostics (tiny): d=downs m=moves u=ups c=cancels t=touch evts
   ctx.textAlign = 'left'; ctx.font = '9px monospace';
   ctx.fillStyle = 'rgba(148,163,184,.45)';
@@ -592,8 +652,13 @@ function draw() {
   ctx.setLineDash([]);
 
   for (const b of bullets) {
+    // tracer: soft glow trail + bright core, so the stream reads as firepower
+    ctx.fillStyle = b.ally ? 'rgba(147,197,253,.25)' : 'rgba(253,224,71,.28)';
+    ctx.fillRect(b.x - 3.5, b.y - 18, 7, 24);
     ctx.fillStyle = b.ally ? '#93c5fd' : '#fde047';
-    ctx.fillRect(b.x - 2, b.y - 7, 4, 10);
+    ctx.fillRect(b.x - 2, b.y - 10, 4, 14);
+    ctx.fillStyle = '#fffbe6';
+    ctx.fillRect(b.x - 1, b.y - 8, 2, 8);
   }
   for (const e of enemies) drawOrc(e);
   for (const pr of pairs) for (const g of pr.groups) if (!g.broken && !g.rewarded && g.orcs.length) drawGateBanner(g);
