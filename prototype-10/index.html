@@ -27,7 +27,8 @@ const TUNE = {
     dmg: 2,
     fireInt: 0.26,           // start dps ≈ 7.7 → one loose grunt dies in ~0.5s of focus
     bulletSpeed: 540,
-    moveLerp: 14,
+    moveLerp: 30,            // near-instant follow — sluggish controls kill fast decisions
+    dragSense: 1.7,          // touch: hero moves 1.7× your finger delta (finger never covers hero)
   },
   grunt: { hp:3.5, hpScale:2.0, speed:42, speedScale:30, r:11, meters:2, hearts:1 },
   brute: { hp:13,  hpScale:2.2, speed:30, speedScale:20, r:17, meters:5, hearts:2 },
@@ -50,7 +51,7 @@ const TUNE = {
     hitEfficiency: 0.7,      // you never land 100% of shots while dodging
     minOrcHp: 3,
   },
-  slowmo: { scale:0.25, dur:0.45 },  // claim moment gets a readable beat
+  slowmo: { scale:0.35, dur:0.28 },  // short readable beat — must not break flow
   leakGraceY: 150,           // danger line height above bottom
 };
 const LINE_Y = H - TUNE.leakGraceY;
@@ -78,25 +79,40 @@ function beep(freq, dur, type, vol) {
 }
 
 // ---------- input ----------
-let pointerX = W / 2, pressed = false;
+// Touch: RELATIVE drag — finger anywhere on screen, hero moves by the delta
+// (amplified), so your finger never covers the action and small flicks are
+// enough to dart between lanes. Mouse: hero follows the cursor x directly.
+let targetX = W / 2, dragLast = null;
 function toGame(e) {
   const r = cvs.getBoundingClientRect();
   const cx = (e.touches ? e.touches[0].clientX : e.clientX);
   return (cx - r.left) / r.width * W;
 }
-function press(e) {
+function ensureAudio() {
   if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (err) {} }
-  pressed = true; pointerX = toGame(e);
-  if (state !== 'play') startRun();
-  e.preventDefault();
 }
-function move(e) { pointerX = toGame(e); e.preventDefault(); }
-cvs.addEventListener('mousedown', press);
-cvs.addEventListener('mousemove', e => { if (pressed || state === 'play') move(e); });
-window.addEventListener('mouseup', () => pressed = false);
-cvs.addEventListener('touchstart', press, { passive:false });
-cvs.addEventListener('touchmove', move, { passive:false });
-window.addEventListener('touchend', () => pressed = false);
+cvs.addEventListener('mousedown', e => {
+  ensureAudio();
+  if (state !== 'play') startRun();
+  targetX = toGame(e);
+  e.preventDefault();
+});
+cvs.addEventListener('mousemove', e => {
+  if (state === 'play') targetX = toGame(e);
+});
+cvs.addEventListener('touchstart', e => {
+  ensureAudio();
+  if (state !== 'play') startRun();
+  dragLast = toGame(e);
+  e.preventDefault();
+}, { passive:false });
+cvs.addEventListener('touchmove', e => {
+  const x = toGame(e);
+  if (dragLast != null) targetX += (x - dragLast) * TUNE.hero.dragSense;
+  dragLast = x;
+  e.preventDefault();
+}, { passive:false });
+window.addEventListener('touchend', () => dragLast = null);
 
 // ---------- upgrades ----------
 const UPGRADES = [
@@ -128,7 +144,7 @@ function startRun() {
   meters = 0; boss = null; bossSpawned = false; bossWarned = false;
   shake = 0; scroll = 0; trickleT = 0.6; surgeT = TUNE.surge.first;
   gateT = TUNE.gates.first; time = 0; kills = 0;
-  timeScale = 1; slowmoT = 0;
+  timeScale = 1; slowmoT = 0; targetX = W / 2; dragLast = null;
   state = 'play';
 }
 
@@ -276,8 +292,8 @@ function update(dt) {
   const t = difficulty();
 
   // hero movement
-  P.tx = Math.max(24, Math.min(W - 24, pointerX));
-  P.x += (P.tx - P.x) * Math.min(1, dt * TUNE.hero.moveLerp);
+  targetX = Math.max(24, Math.min(W - 24, targetX));
+  P.x += (targetX - P.x) * Math.min(1, dt * TUNE.hero.moveLerp);
 
   // firing (hero + allies fire together)
   P.fireT -= dt;
