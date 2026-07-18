@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>Prototype 10 — Reverse Gate Runner</title>
 <style>
-  html, body { margin:0; padding:0; background:#0b0e14; height:100%; overflow:hidden; touch-action:none; }
+  html, body { margin:0; padding:0; background:#0b0e14; height:100%; overflow:hidden; touch-action:none; overscroll-behavior:none; }
   #wrap { display:flex; align-items:center; justify-content:center; height:100%; }
   canvas { background:#151a23; box-shadow:0 0 60px rgba(0,0,0,.6); border-radius:6px; touch-action:none; }
 </style>
@@ -114,7 +114,14 @@ cvs.addEventListener('pointermove', e => {
   if (state !== 'play') return;
   const x = toGameX(e.clientX);
   if (e.pointerType === 'mouse') { targetX = clampX(x); return; }
-  if (e.pointerId !== dragId || dragLast == null) return;
+  // If the container fired a pointercancel mid-gesture (swipe hijack) and
+  // events resume, RE-SEED the drag instead of ignoring the rest of the
+  // gesture — the finger never left the screen, so the drag must survive.
+  if (e.pointerId !== dragId || dragLast == null) {
+    dragId = e.pointerId; dragLast = x;
+    e.preventDefault();
+    return;
+  }
   targetX = clampX(targetX + (x - dragLast) * TUNE.hero.dragSense);
   dragLast = x;
   e.preventDefault();
@@ -124,6 +131,13 @@ function endDrag(e) {
 }
 cvs.addEventListener('pointerup', endDrag);
 cvs.addEventListener('pointercancel', endDrag);
+// iOS/WebView hardening: gesture hijacking (swipe-back, panel swipes) can
+// only be blocked on the RAW touch events — preventDefault on pointer
+// events does nothing for that on iOS. These handlers do no logic; they
+// exist purely to keep the container's hands off horizontal swipes.
+for (const t of ['touchstart', 'touchmove', 'touchend']) {
+  cvs.addEventListener(t, e => { e.preventDefault(); e.stopPropagation(); }, { passive:false });
+}
 
 // ---------- upgrades (bronze / silver / gold effects per tier) ----------
 const UPGRADES = [
