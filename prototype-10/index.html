@@ -50,6 +50,13 @@ const TUNE = {
     focusSeconds: 2.3,
     hitEfficiency: 0.7,      // you never land 100% of shots while dodging
     minOrcHp: 3,
+    // THE GREED LINE — the identity mechanic. Gates TIER UP as they approach:
+    // bronze at spawn, silver at 45% of the march, gold at 75% (right above
+    // your line). Claim early = safe but weak; let it come = strong but the
+    // squad is about to break through and the rest of the horde marches on.
+    // In a runner the choice is free; here choosing has a price. Waiting is
+    // the bet, leaking is the bust.
+    tierAt: [0.45, 0.75],
   },
   slowmo: { scale:0.35, dur:0.28 },  // short readable beat — must not break flow
   leakGraceY: 150,           // danger line height above bottom
@@ -114,14 +121,26 @@ cvs.addEventListener('touchmove', e => {
 }, { passive:false });
 window.addEventListener('touchend', () => dragLast = null);
 
-// ---------- upgrades ----------
+// ---------- upgrades (bronze / silver / gold effects per tier) ----------
 const UPGRADES = [
-  { key:'dmg',    label:'DAMAGE +50%',     color:'#4ade80', apply:p => p.dmg *= 1.5 },
-  { key:'rate',   label:'FIRE RATE ×1.35', color:'#facc15', apply:p => p.fireInt = Math.max(0.06, p.fireInt * 0.74) },
-  { key:'multi',  label:'+1 SHOT',         color:'#38bdf8', apply:p => p.shots += 1 },
-  { key:'pierce', label:'PIERCING +1',     color:'#c084fc', apply:p => p.pierce += 1 },
-  { key:'ally',   label:'+1 ALLY',         color:'#fb923c', apply:p => p.allies += 1 },
+  { key:'dmg',    color:'#4ade80',
+    labels:['DAMAGE +40%','DAMAGE +70%','DAMAGE +120%'],
+    apply:(p,t) => p.dmg *= [1.4, 1.7, 2.2][t] },
+  { key:'rate',   color:'#facc15',
+    labels:['FIRE RATE ×1.25','FIRE RATE ×1.45','FIRE RATE ×1.7'],
+    apply:(p,t) => p.fireInt = Math.max(0.06, p.fireInt * [0.80, 0.69, 0.59][t]) },
+  { key:'multi',  color:'#38bdf8',
+    labels:['+1 SHOT','+2 SHOTS','+3 SHOTS'],
+    apply:(p,t) => p.shots += t + 1 },
+  { key:'pierce', color:'#c084fc',
+    labels:['PIERCING +1','PIERCING +2','PIERCING +3'],
+    apply:(p,t) => p.pierce += t + 1 },
+  { key:'ally',   color:'#fb923c',
+    labels:['+1 ALLY','+2 ALLIES','+3 ALLIES'],
+    apply:(p,t) => p.allies += t + 1 },
 ];
+const TIER_COLORS = ['#cd7f32', '#cbd5e1', '#fbbf24'];
+const TIER_NAMES  = ['BRONZE', 'SILVER', 'GOLD'];
 function pickTwoUpgrades() {
   const a = UPGRADES[(Math.random() * UPGRADES.length) | 0];
   let b = a;
@@ -203,7 +222,7 @@ function spawnGatePair() {
   const centers = [W * 0.27, W * 0.73];
   const orcHp = squadOrcHp();
   [ua, ub].forEach((upg, gi) => {
-    const g = { cx: centers[gi], upg, broken:false, rewarded:false, orcs: [] };
+    const g = { cx: centers[gi], upg, tier:0, pop:0, broken:false, rewarded:false, orcs: [] };
     for (let i = 0; i < TUNE.gates.squadSize; i++) {
       const ox = g.cx + (i % 3 - 1) * 26 + (Math.random() * 8 - 4);
       const oy = -40 - ((i / 3) | 0) * 30 - Math.random() * 8;
@@ -242,11 +261,11 @@ function bannerPos(g) {
 // ---------- group / gate logic ----------
 function claimGate(g, atX, atY) {
   g.rewarded = true;
-  g.upg.apply(P);
+  g.upg.apply(P, g.tier);
   P.gunLvl++;
   // banner flies to the hero — the "you picked THIS" beat
-  flyers.push({ kind:'claim', x:atX, y:atY, label:g.upg.label, color:g.upg.color, t:0 });
-  burst(atX, atY, g.upg.color, 20);
+  flyers.push({ kind:'claim', x:atX, y:atY, label:g.upg.labels[g.tier], color:g.upg.color, frame:TIER_COLORS[g.tier], t:0 });
+  burst(atX, atY, TIER_COLORS[g.tier], 20);
   timeScale = TUNE.slowmo.scale; slowmoT = TUNE.slowmo.dur;
   beep(520, 0.15, 'square', 0.08); beep(780, 0.2, 'square', 0.08);
   // the other gate in the pair visibly shatters
@@ -259,7 +278,7 @@ function breakGate(g, reason) {
   const pos = bannerPos(g) || { x:g.cx, y:LINE_Y - 60 };
   g.orcs.forEach(o => o.group = null);
   // banner falls off screen with a cross through it — you SEE it break
-  flyers.push({ kind:'break', x:pos.x, y:pos.y, label:g.upg.label, color:g.upg.color,
+  flyers.push({ kind:'break', x:pos.x, y:pos.y, label:g.upg.labels[g.tier], color:g.upg.color,
                 t:0, vx:(Math.random()*60-30), vy:-60, rot:0, vr:(Math.random()<0.5?-1:1)*(2+Math.random()*2) });
   burst(pos.x, pos.y, '#94a3b8', 10);
   if (reason === 'leaked') addText(pos.x, pos.y - 20, 'GATE LOST', '#94a3b8', 1.2);
@@ -339,6 +358,25 @@ function update(dt) {
   enemies = enemies.filter(e => !e.dead);
   bullets = bullets.filter(b => !b.dead);
   pairs = pairs.filter(pr => pr.groups.some(g => !g.broken && !g.rewarded && g.orcs.length));
+
+  // greed line: gates tier up as their squad nears your line
+  for (const pr of pairs) for (const g of pr.groups) {
+    if (g.broken || g.rewarded || !g.orcs.length) continue;
+    let front = -1e9;
+    for (const o of g.orcs) front = Math.max(front, o.y);
+    const frac = front / LINE_Y;
+    const newTier = frac >= TUNE.gates.tierAt[1] ? 2 : frac >= TUNE.gates.tierAt[0] ? 1 : 0;
+    if (newTier > g.tier) {
+      g.tier = newTier; g.pop = 0.35;
+      const pos = bannerPos(g);
+      if (pos) {
+        addText(pos.x, pos.y - 24, TIER_NAMES[newTier] + '!', TIER_COLORS[newTier], 1.1);
+        burst(pos.x, pos.y, TIER_COLORS[newTier], 10);
+      }
+      beep(newTier === 2 ? 940 : 700, 0.12, 'square', 0.06);
+    }
+    if (g.pop > 0) g.pop -= dt;
+  }
 
   // spawning
   if (!bossSpawned) {
@@ -424,13 +462,19 @@ function drawBanner(x, y, label, color, opts) {
   const scale = (opts && opts.scale) || 1;
   const rot = (opts && opts.rot) || 0;
   const alpha = (opts && opts.alpha != null) ? opts.alpha : 1;
+  const frame = (opts && opts.frame) || color;
   ctx.save();
   ctx.translate(x, y); ctx.rotate(rot); ctx.scale(scale, scale);
   ctx.globalAlpha = alpha;
   ctx.fillStyle = 'rgba(10,12,18,.88)';
   ctx.fillRect(-w/2, -h/2, w, h);
-  ctx.strokeStyle = color; ctx.lineWidth = 2;
+  ctx.strokeStyle = frame; ctx.lineWidth = (opts && opts.tier) === 2 ? 3 : 2;
   ctx.strokeRect(-w/2, -h/2, w, h);
+  if (opts && opts.tier != null) {
+    ctx.fillStyle = frame;
+    ctx.font = 'bold 9px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('★'.repeat(opts.tier + 1), 0, -h/2 - 7);
+  }
   ctx.fillStyle = color;
   ctx.font = 'bold 13px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
   ctx.fillText(label, 0, 0);
@@ -448,7 +492,8 @@ function drawBanner(x, y, label, color, opts) {
 function drawGateBanner(g) {
   const pos = bannerPos(g);
   if (!pos || pos.y < 10) return;
-  drawBanner(pos.x, pos.y, g.upg.label, g.upg.color);
+  drawBanner(pos.x, pos.y, g.upg.labels[g.tier], g.upg.color,
+             { frame: TIER_COLORS[g.tier], tier: g.tier, scale: 1 + Math.max(0, g.pop) * 0.8 });
   const alive = g.orcs.filter(o => !o.dead);
   ctx.strokeStyle = 'rgba(148,163,184,.5)'; ctx.lineWidth = 1;
   ctx.beginPath();
@@ -537,7 +582,7 @@ function draw() {
   }
   // flying / breaking banners on top — the choice moment must be unmissable
   for (const f of flyers) {
-    if (f.kind === 'claim') drawBanner(f.x, f.y, f.label, f.color, { scale: 1 + f.t * 0.7 });
+    if (f.kind === 'claim') drawBanner(f.x, f.y, f.label, f.color, { scale: 1 + f.t * 0.7, frame: f.frame });
     else drawBanner(f.x, f.y, f.label, '#64748b', { rot: f.rot, alpha: Math.max(0, 1 - f.t / 1.3), crossed: true });
   }
   for (const ft of texts) {
@@ -556,7 +601,7 @@ function draw() {
   }
 
   if (state === 'menu') {
-    overlay('PROTOTYPE 10', 'REVERSE GATE RUNNER\n\nDrag to move — you fire automatically.\nOrc squads with colored rings\ncarry upgrade gates:\nwipe a squad to claim its gate.\nShooting IS choosing.\n\nPush the horde back ' + TUNE.goal + 'm\nand slay the Warlord.', '#4ade80');
+    overlay('PROTOTYPE 10', 'REVERSE GATE RUNNER\n\nDrag to move — you fire automatically.\nOrc squads carry upgrade gates:\nwipe a squad to claim its gate.\nShooting IS choosing.\n\nGates grow BRONZE → SILVER → GOLD\nas they near your line.\nGreed wisely.\n\nPush the horde back ' + TUNE.goal + 'm\nand slay the Warlord.', '#4ade80');
   } else if (state === 'over') {
     overlay('OVERRUN', 'The horde broke through.\n\nPushed back: ' + (meters|0) + 'm\nKills: ' + kills, '#f87171');
   } else if (state === 'win') {

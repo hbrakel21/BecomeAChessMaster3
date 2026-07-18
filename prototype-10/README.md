@@ -25,6 +25,21 @@ This prototype tests whether the runner-genre appeal survives the inversion:
 3. **Snowball fantasy** → visible weapon evolution + allies joining you.
 4. **Tension** → the approaching wall of orcs is the timer.
 
+## The greed line — the identity mechanic
+
+In a runner the gate choice is free: you pass it anyway. Here, choosing has a
+price — and the game leans into it. **Gates tier up as they approach you**:
+
+- 🥉 **Bronze** at spawn (e.g. `+1 SHOT`)
+- 🥈 **Silver** at 45% of the march (`+2 SHOTS`)
+- 🥇 **Gold** at 75% — right above your danger line (`+3 SHOTS`)
+
+Claim early = safe but weak. Let it come = strong, but the squad is seconds
+from breaking through, and the rest of the horde marches on while you wait.
+Every gate is a push-your-luck bet that changes value by the second. A runner
+cannot do this — the run speed decides when you pass a gate; here *you*
+decide the moment, and the moment costs something.
+
 ## Balance design (the `TUNE` object in index.html)
 
 All balance dials live in one `TUNE` object at the top of the file, each with
