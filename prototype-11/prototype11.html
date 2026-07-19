@@ -1,0 +1,1273 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Prototype 11 — Reverse Gate Runner: Build Identity</title>
+<style>
+  html, body { margin:0; padding:0; background:#0b0e14; height:100%; overflow:hidden; touch-action:none; overscroll-behavior:none; }
+  #wrap { display:flex; align-items:center; justify-content:center; height:100%; }
+  canvas { background:#151a23; box-shadow:0 0 60px rgba(0,0,0,.6); border-radius:6px; touch-action:none; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="cvs" width="480" height="800"></canvas></div>
+<script>
+'use strict';
+// =====================================================================
+// PROTOTYPE 11 — BUILD IDENTITY ITERATION. PLAN:
+// (a) 5 BRANCHES with levels 1–6 and keystones at 5; stats are RECOMPUTED
+//     from branch levels (not incrementally applied) so tier jumps of
+//     +1/+2/+3 stay consistent and the HUD can always show truth.
+// (b) Gate spawning picks 2 different branches, weighted 60% invested /
+//     40% fresh; banners show "BRANCH LvX→Y" and pulse when a gate would
+//     unlock a keystone. Tier = levels gained (bronze +1 / silver +2 /
+//     gold +3), so the greed line gambles on reaching keystones earlier.
+// (c) On-hit effect framework: bullets are plain objects carrying rail
+//     stacks / overkill carry / incendiary flags; enemies carry burn and
+//     shield status. All five keystones run through one hitEnemy().
+// (d) Mastery lock: the 2nd branch to reach lvl 5 locks the other three
+//     (their gates stop spawning; on-screen ones shatter) with a slowmo
+//     beat. A run IS its two keystones.
+// (e) 3 acts to 1000m with Champions between them, Shieldbearers (act 2),
+//     Shamans (act 3), and a 3-phase Warlord scaled to live DPS.
+// (f) Telemetry: window.TELEMETRY logs claims/breaks/keystones/lock/runs
+//     plus a per-second damage ring; debug overlay on 'D' key or
+//     triple-tap in the top-left corner.
+// =====================================================================
+const W = 480, H = 800;
+const cvs = document.getElementById('cvs');
+const ctx = cvs.getContext('2d');
+
+// =====================================================================
+// TUNING — every balance dial lives here, with the reasoning attached.
+// =====================================================================
+const TUNE = {
+  // SATISFACTION RULE: fun in this genre = feedback density × power fantasy.
+  // Many weak enemies mowed constantly beats few "fair" enemies killed
+  // occasionally. Base grunts die to ONE bullet; volume brings difficulty.
+  hero: {
+    dmg: 1.3,
+    fireInt: 0.15,           // fast stream — the gun must FEEL like a hose
+    bulletSpeed: 560,
+    moveLerp: 30,            // near-instant follow — sluggish controls kill fast decisions
+  },
+  // Branch scaling. Each stat family gets its own curve so branches stay
+  // mechanically distinct rather than converging on "more DPS":
+  branch: {
+    fireDmgPerLvl: 0.45,     // FIREPOWER: +45%/lvl → lvl4 ≈ ×2.8; the "few big hits" axis
+    velIntMul: 0.85,         // VELOCITY: fire interval ×0.85/lvl (compounding) + speed
+    velSpeedPerLvl: 0.10,    //   +10% bullet speed/lvl — screen coverage via projectile pace
+    spreadShotsPer2: 1,      // SPREAD: +1 shot per 2 lvls; smooths as knockback fills odd lvls
+    spreadKnockPerLvl: 0.30, //   +30% knockback/lvl — SPREAD owns crowd *control*, not just count
+    piercePerLvl: 1,         // PIERCE: 1 extra target/lvl — the column-deletion axis
+    cmdAllyPer2: 1,          // COMMAND: +1 ally per 2 lvls…
+    cmdAllyDmgPerLvl: 0.15,  //   …and +15% ally damage/lvl so odd levels still matter
+    maxLevel: 6,             // 6 = keystone (5) + one capstone level of stats
+  },
+  // Keystone mechanics (unlock at branch lvl 5):
+  ks: {
+    moltenEvery: 4,          // VELOCITY: every 4th volley is incendiary — rhythm you can see
+    burnDpsMul: 1.6,         // burn dps = heroDmg×1.6: strong vs tanks, wasted on 1-hp grunts
+    burnDur: 2.0,            // seconds; long enough to spread on death, short enough to matter
+    burnRadius: 60,          // death-spread radius: one squad clump, not half the screen
+    railPct: 0.20,           // PIERCE: +20% dmg per enemy already pierced this shot
+    wallPct: 0.45,           // SPREAD: shove-splash deals 45% of hit dmg to touching neighbors.
+                             //   (Simplification: knockback amount stands in for shove velocity —
+                             //   proportionality preserved, no per-enemy physics needed.)
+    wallRadius: 34,          // "shoved INTO each other": only adjacent bodies, not a free AoE
+    bannerMul: 0.5,          // COMMAND: allies inherit keystones at 50% strength
+    overkillMin: 0.3,        // ignore dust-sized overkill carries — no zombie bullets
+  },
+  grunt:  { hp:1.2, hpScale:1.8, speed:46, speedScale:26, r:11, meters:1, hearts:1 },
+  brute:  { hp:10,  hpScale:2.2, speed:30, speedScale:20, r:17, meters:4, hearts:2 },
+  // Shieldbearer (act 2+): shield eats the first N hits per second. Punishes
+  // many-weak-hits builds (pure VELOCITY), rewards few-big-hits (FIREPOWER)
+  // and PIERCE (piercing rounds ignore shields — the railgun fantasy).
+  shield: { hp:5, hpScale:1.8, speed:34, speedScale:16, r:13, meters:2, hearts:2,
+            blocksPerSec:3 },
+  // Shaman (act 3): holds at the back and heals nearby grunts — a priority
+  // target that punishes ignoring the backline.
+  shaman: { hp:8, hpScale:1.5, r:12, meters:3, holdY:170, speed:36,
+            healEvery:2.0, healPct:0.35, healRadius:90, maxAlive:2 },
+  champion: { hpMul:6, speedMul:0.6, rMul:1.5, hearts:4, meters:12 },
+  // Warlord: HP scales to LIVE act-3 dps (~22s of sustained fire) so builds
+  // are tested, not stat walls. 3 phases; adds force keystones to matter.
+  warlord:  { dpsSeconds:22, minHp:1500, speed:12, r:42,
+              addsPhase2Every:2.5, addsPhase3Every:1.6, phase3SpeedMul:1.6 },
+  // Physical feedback: every bullet SHOVES its victim back (the tug-of-war,
+  // felt per hit), kills chain into a combo that pays out extra meters, and
+  // big kills freeze the frame for a beat.
+  feel: {
+    knockback: 13,           // px shoved per bullet hit (bosses barely budge)
+    hitstop: 0.07,           // seconds of near-freeze on brute-class kills
+    comboWindow: 1.1,        // kills within this window chain
+    comboMinPayout: 8,       // combos this size pay bonus push meters
+    killPulse: 70,           // world-scroll surge per kill (mowing = momentum)
+  },
+  // The horde marches in a corridor that WIDENS as you get stronger.
+  // With 1 shot you can only defend a narrow strip; the field must grow
+  // with your firepower, not start at full width.
+  corridor: { start:0.55, end:1.0 },
+  // Pacing: a dense stream punctuated by surges → constant mowing, spikes of chaos.
+  trickle: { startInt:0.55, endInt:0.32, denStart:1.2, denScale:2.5 },
+  surge:   { first:12, every:7, size:8, sizeScale:8 },
+  // 3 acts, ~10–12 min total. difficulty() is act-aware: each act starts a
+  // bit BELOW where the last one peaked (sawtooth over a rising baseline)
+  // so act openings breathe before climbing.
+  acts: {
+    ends: [250, 600, 1000],  // act boundaries in meters
+    base: [0, 0.45, 0.80],   // baseline difficulty at each act start
+    ramp: 0.40,              // local climb across an act (base+ramp > next base = sawtooth)
+  },
+  gates: {
+    first: 3,                // teach the core mechanic within seconds
+    // Cadence: a full run offers ~25 pairs. Player claims roughly half at
+    // avg tier silver → ~24 levels: enough to master two branches (12) and
+    // explore, not enough to max everything. Scarcity makes gates decisions.
+    min: 18, max: 24,
+    squadSize: 5,
+    // KEY RULE: squad HP scales with the player's CURRENT EFFECTIVE dps
+    // (keystones included — see playerDps) so that wiping a squad always
+    // takes ~focusSeconds of focused fire. The choice must stay "which
+    // gate", never "can I even get one".
+    focusSeconds: 2.3,
+    hitEfficiency: 0.7,      // you never land 100% of shots while dodging
+    minOrcHp: 3,
+    // THE GREED LINE — gates TIER UP as they approach: bronze at spawn,
+    // silver at 45% of the march, gold at 75%. Tier = branch levels gained
+    // (+1/+2/+3), so gold is gambling on reaching your keystone 1–2 gates
+    // earlier. DESIGN HEALTH METRIC: across playtests, gold claims should
+    // be 25–45% of all claims (see TELEMETRY.goldPct). If >60%, gold is
+    // too safe — raise squad march speed or these thresholds. If <15%,
+    // gold is too punishing — lower them. The bet must stay a real bet.
+    tierAt: [0.45, 0.75],
+    investedWeight: 0.6,     // 60% of gate offers favor invested branches:
+                             // exploratory early (nothing invested), build-completing late
+  },
+  slowmo: { scale:0.35, dur:0.28 },  // short readable beat — must not break flow
+  bigBeat: { scale:0.2, dur:0.6 },   // keystone/mastery moments earn a LONG beat
+  leakGraceY: 150,           // danger line height above bottom
+};
+const LINE_Y = H - TUNE.leakGraceY;
+
+// ---------- responsive scale ----------
+function fit() {
+  const s = Math.min(window.innerWidth / W, window.innerHeight / H) * 0.98;
+  cvs.style.width  = (W * s) + 'px';
+  cvs.style.height = (H * s) + 'px';
+}
+window.addEventListener('resize', fit); fit();
+
+// ---------- tiny audio ----------
+let AC = null;
+function beep(freq, dur, type, vol) {
+  if (!AC) return;
+  try {
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = type || 'square'; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol || 0.05, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + dur);
+    o.connect(g); g.connect(AC.destination);
+    o.start(); o.stop(AC.currentTime + dur);
+  } catch (e) {}
+}
+
+// ---------- input ----------
+// STATELESS absolute control. Every event alone fully determines the hero's
+// target: the hero goes where your finger/cursor IS. No drag deltas, no
+// stored gesture state, no pointer ids — because any stateful scheme lets a
+// single lost/cancelled/reordered event poison the rest of the gesture.
+// Here, whatever event arrives — in any order, after any interruption —
+// positions the hero correctly. Direction cannot matter by construction.
+let targetX = W / 2;
+const clampX = x => Math.max(24, Math.min(W - 24, x));
+function toGameX(clientX) {
+  const r = cvs.getBoundingClientRect();
+  return (clientX - r.left) / r.width * W;
+}
+function ensureAudio() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (err) {} }
+}
+// input diagnostics: event counters shown tiny in the corner. If the "m"
+// counter freezes while your finger is moving, the embedding environment is
+// eating the events — that is then provably not a game bug.
+const inStats = { d:0, m:0, u:0, c:0, t:0, lastX:0 };
+function steer(e) {
+  inStats.lastX = targetX = clampX(toGameX(e.clientX));
+}
+cvs.addEventListener('pointerdown', e => {
+  ensureAudio();
+  if (state !== 'play') startRun();
+  inStats.d++;
+  steer(e);
+  try { cvs.setPointerCapture(e.pointerId); } catch (err) {}
+  e.preventDefault();
+});
+cvs.addEventListener('pointermove', e => {
+  inStats.m++;
+  if (state !== 'play') return;
+  steer(e);
+  e.preventDefault();
+});
+cvs.addEventListener('pointerup', e => inStats.u++);
+cvs.addEventListener('pointercancel', e => inStats.c++);
+// Raw touch events as a REDUNDANT input path: if the environment delivers
+// touch events but suppresses pointer events (or vice versa), steering still
+// works. Also preventDefault here is the only thing iOS respects for
+// blocking container gestures (swipe-back, panel swipes).
+cvs.addEventListener('touchstart', e => {
+  ensureAudio();
+  if (state !== 'play') startRun();
+  inStats.t++;
+  if (e.touches[0]) { inStats.lastX = targetX = clampX(toGameX(e.touches[0].clientX)); }
+  e.preventDefault(); e.stopPropagation();
+}, { passive:false });
+cvs.addEventListener('touchmove', e => {
+  inStats.t++;
+  if (e.touches[0]) { inStats.lastX = targetX = clampX(toGameX(e.touches[0].clientX)); }
+  e.preventDefault(); e.stopPropagation();
+}, { passive:false });
+cvs.addEventListener('touchend', e => { e.preventDefault(); e.stopPropagation(); }, { passive:false });
+
+// Debug toggles live in SEPARATE listeners — the input system above is
+// untouched. 'D' key, or triple-tap the top-left corner within 900ms.
+let debugOn = false, dbgTaps = [];
+window.addEventListener('keydown', e => { if (e.key === 'd' || e.key === 'D') debugOn = !debugOn; });
+cvs.addEventListener('pointerdown', e => {
+  const x = toGameX(e.clientX);
+  const r = cvs.getBoundingClientRect();
+  const y = (e.clientY - r.top) / r.height * H;
+  if (x < 80 && y < 80) {
+    const now = performance.now();
+    dbgTaps = dbgTaps.filter(tp => now - tp < 900);
+    dbgTaps.push(now);
+    if (dbgTaps.length >= 3) { debugOn = !debugOn; dbgTaps = []; }
+  }
+});
+
+// ---------- branches ----------
+const BRANCHES = [
+  { key:'fire',   name:'FIREPOWER', abbr:'FIRE', color:'#f87171', keystone:'OVERKILL' },
+  { key:'vel',    name:'VELOCITY',  abbr:'VEL',  color:'#facc15', keystone:'MOLTEN BARREL' },
+  { key:'spread', name:'SPREAD',    abbr:'SPRD', color:'#38bdf8', keystone:'WALL OF LEAD' },
+  { key:'pierce', name:'PIERCE',    abbr:'PRC',  color:'#c084fc', keystone:'RAILGUN' },
+  { key:'cmd',    name:'COMMAND',   abbr:'CMD',  color:'#fb923c', keystone:'WAR BANNER' },
+];
+const TIER_COLORS = ['#cd7f32', '#cbd5e1', '#fbbf24'];
+const TIER_NAMES  = ['BRONZE', 'SILVER', 'GOLD'];
+
+// Derived stats are RECOMPUTED from branch levels each time levels change —
+// no incremental application, so +1/+2/+3 tier jumps can never drift.
+function recompute() {
+  const b = P.br, T = TUNE.branch;
+  P.ks = {};
+  for (const br of BRANCHES) P.ks[br.key] = b[br.key] >= 5;
+  P.dmg = TUNE.hero.dmg * (1 + T.fireDmgPerLvl * b.fire);
+  P.fireInt = Math.max(0.06, TUNE.hero.fireInt * Math.pow(T.velIntMul, b.vel));
+  P.bulletSpeed = TUNE.hero.bulletSpeed * (1 + T.velSpeedPerLvl * b.vel);
+  P.shots = 1 + Math.floor(b.spread / 2) * T.spreadShotsPer2;
+  P.knock = TUNE.feel.knockback * (1 + T.spreadKnockPerLvl * b.spread) * (P.ks.spread ? 2 : 1);
+  P.pierce = b.pierce * T.piercePerLvl;
+  P.allies = Math.floor(b.cmd / 2) * T.cmdAllyPer2;
+  P.allyDmgMul = 0.4 * (1 + T.cmdAllyDmgPerLvl * b.cmd);
+  P.gunLvl = Math.min(6, totalLevels());
+}
+function totalLevels() {
+  let s = 0; for (const br of BRANCHES) s += P.br[br.key]; return s;
+}
+function masteredKeys() {
+  return BRANCHES.filter(br => P.br[br.key] >= 5).map(br => br.key);
+}
+
+// ---------- telemetry ----------
+const TELEMETRY = {
+  claims: [], breaks: [], keystones: [], lock: null, runs: [],
+  dpsRing: new Float32Array(60),  // damage dealt per game-second, last 60s
+  get goldPct() {
+    const n = this.claims.length;
+    return n ? Math.round(100 * this.claims.filter(c => c.tier === 2).length / n) : 0;
+  },
+};
+window.TELEMETRY = TELEMETRY;
+let dpsSec = 0;
+function dmgLog(d) { TELEMETRY.dpsRing[dpsSec % 60] += d; }
+function rollingDps() {
+  // average of the last 3 full seconds — stable enough for claim logging
+  let s = 0;
+  for (let i = 1; i <= 3; i++) s += TELEMETRY.dpsRing[(dpsSec - i + 60) % 60];
+  return s / 3;
+}
+
+// ---------- state ----------
+let state = 'menu'; // menu | play | over | win
+let P = null, bullets = [], enemies = [], pairs = [], parts = [], texts = [], flyers = [];
+let meters = 0, warlord = null, warlordSpawned = false;
+let champion = null, championsKilled = 0;
+let locked = false;
+let shake = 0, scroll = 0, trickleT = 0, surgeT = 0, gateT = 0, time = 0, kills = 0;
+let timeScale = 1, slowmoT = 0;
+let combo = 0, comboT = 0, killPulse = 0;
+let heartsLost = [0, 0, 0];
+let fpsFrames = 0, fpsVal = 60, fpsLast = performance.now();
+
+function startRun() {
+  P = { x:W/2, y:H-95, hearts:10, fireT:0, muzzle:0, shotNo:0,
+        br:{ fire:0, vel:0, spread:0, pierce:0, cmd:0 } };
+  recompute();
+  bullets = []; enemies = []; pairs = []; parts = []; texts = []; flyers = [];
+  meters = 0; warlord = null; warlordSpawned = false;
+  champion = null; championsKilled = 0; locked = false;
+  shake = 0; scroll = 0; trickleT = 0.6; surgeT = TUNE.surge.first;
+  gateT = TUNE.gates.first; time = 0; kills = 0;
+  timeScale = 1; slowmoT = 0; targetX = W / 2;
+  combo = 0; comboT = 0; killPulse = 0;
+  heartsLost = [0, 0, 0];
+  TELEMETRY.claims = []; TELEMETRY.breaks = []; TELEMETRY.keystones = [];
+  TELEMETRY.lock = null; TELEMETRY.dpsRing.fill(0); dpsSec = 0;
+  state = 'play';
+}
+
+// ---------- acts & difficulty ----------
+function actIdx() { return Math.min(2, championsKilled); }
+function actStart(i) { return i === 0 ? 0 : TUNE.acts.ends[i - 1]; }
+// Sawtooth over a rising baseline: each act opens BELOW the previous act's
+// peak, then climbs past it. Small time drip stops difficulty-farming a
+// stalled run. Can exceed 1 in act 3 — enemy formulas are linear in t.
+function difficulty() {
+  const a = actIdx();
+  const s = actStart(a), e = TUNE.acts.ends[a];
+  const frac = Math.min(1, Math.max(0, (meters - s) / (e - s)));
+  return TUNE.acts.base[a] + frac * TUNE.acts.ramp + time / 1200;
+}
+// Meters freeze during boss fights: bosses are about the fight, not farming.
+function gainMeters(v) { if (!champion && !warlord) meters += v; }
+
+// ---------- effective DPS (drives squad HP — keystones MUST count, or
+// late-game squads become trivially wipeable and the gate tension dies) ----
+function playerDps() {
+  let per = P.dmg;
+  if (P.ks.pierce) per *= 1 + TUNE.ks.railPct * 0.5 * P.pierce; // avg rail stacks ≈ pierce/2
+  if (P.ks.fire) per *= 1.15;                                   // overkill salvages ~15% waste
+  let dps = per * P.shots / P.fireInt;
+  if (P.ks.vel)                                                 // burn uptime ≈ dur / (every×int), capped
+    dps *= 1 + Math.min(0.5, TUNE.ks.burnDpsMul / TUNE.ks.moltenEvery * 0.4);
+  if (P.ks.spread) dps *= 1.2;                                  // wall splash on packed squads
+  dps += P.allies * P.dmg * P.allyDmgMul / P.fireInt;
+  return dps;
+}
+function squadOrcHp() {
+  const total = playerDps() * TUNE.gates.hitEfficiency * TUNE.gates.focusSeconds;
+  return Math.max(TUNE.gates.minOrcHp, total / TUNE.gates.squadSize);
+}
+
+// ---------- spawning ----------
+function baseEnemy(x, y, kind, c, t) {
+  const e = { x, y, r:c.r, hp:c.hp * (1 + (c.hpScale || 0) * t), maxhp:0,
+              speed:(c.speed || 0) + (c.speedScale || 0) * t, kind,
+              group:null, wob:Math.random() * 6.28, flash:0,
+              burnT:0, burnDps:0, burnAcc:0 };
+  e.maxhp = e.hp; enemies.push(e); return e;
+}
+function spawnGrunt(x, y, group, hpOverride) {
+  const e = baseEnemy(x, y, 'grunt', TUNE.grunt, difficulty());
+  if (hpOverride) { e.hp = e.maxhp = hpOverride; }
+  e.group = group || null;
+  return e;
+}
+function spawnBrute(x, y) { return baseEnemy(x, y, 'brute', TUNE.brute, difficulty()); }
+function spawnShield(x, y) {
+  const e = baseEnemy(x, y, 'shield', TUNE.shield, difficulty());
+  e.shieldC = TUNE.shield.blocksPerSec; e.shieldT = 0;
+  return e;
+}
+function spawnShaman(x, y) {
+  const e = baseEnemy(x, y, 'shaman', TUNE.shaman, difficulty());
+  e.healT = TUNE.shaman.healEvery; e.healFx = 0;
+  return e;
+}
+function spawnChampion() {
+  const t = difficulty(), c = TUNE.brute, ch = TUNE.champion;
+  const e = baseEnemy(W/2, -60, 'champion', {
+    hp: c.hp * (1 + c.hpScale * t) * ch.hpMul, r: c.r * ch.rMul,
+    speed: (c.speed + c.speedScale * t) * ch.speedMul,
+  }, 0);
+  champion = e;
+  addText(W/2, 260, 'A CHAMPION BLOCKS THE WAY!', '#f87171', 2.4);
+  beep(110, 0.5, 'sawtooth', 0.11);
+}
+function spawnWarlord() {
+  const c = TUNE.warlord;
+  const hp = Math.max(c.minHp, playerDps() * c.dpsSeconds);
+  const e = { x:W/2, y:-70, r:c.r, hp, maxhp:hp, speed:c.speed, kind:'boss',
+              group:null, wob:0, flash:0, burnT:0, burnDps:0, burnAcc:0, addT:2 };
+  enemies.push(e); warlord = e; warlordSpawned = true;
+  addText(W/2, 260, 'THE WARLORD APPROACHES!', '#f87171', 2.6);
+  beep(90, 0.6, 'sawtooth', 0.12);
+}
+function corridorX(frac01) {
+  const t = Math.min(1, difficulty());
+  const cw = (W - 80) * (TUNE.corridor.start + (TUNE.corridor.end - TUNE.corridor.start) * t);
+  return W / 2 + (frac01 - 0.5) * cw;
+}
+function spawnTrickle() {
+  if (enemies.length > 160) return;
+  const t = difficulty(), a = actIdx();
+  const n = 1 + ((Math.random() * (TUNE.trickle.denStart + Math.min(1, t) * TUNE.trickle.denScale)) | 0);
+  for (let i = 0; i < n; i++) {
+    const x = corridorX(Math.random());
+    const roll = Math.random();
+    if (a >= 2 && roll < 0.05 && enemies.filter(e => e.kind === 'shaman' && !e.dead).length < TUNE.shaman.maxAlive) {
+      spawnShaman(x, -20 - Math.random() * 60);
+    } else if (a >= 1 && roll < 0.17) {
+      spawnShield(x, -20 - Math.random() * 60);
+    } else if (roll < 0.10 + Math.min(1, t) * 0.15 + 0.17 * (a >= 1 ? 1 : 0)) {
+      // brute share rises with acts so act openings aren't pure chaff
+      spawnBrute(x, -20 - Math.random() * 60);
+    } else {
+      spawnGrunt(x, -20 - Math.random() * 60, null);
+    }
+  }
+}
+function spawnSurge() {
+  if (enemies.length > 160) return;
+  const t = Math.min(1, difficulty());
+  const n = (TUNE.surge.size + t * TUNE.surge.sizeScale) | 0;
+  for (let i = 0; i < n; i++) {
+    const x = corridorX((i + 0.5) / n) + (Math.random() * 20 - 10);
+    spawnGrunt(x, -20 - Math.random() * 40, null);
+  }
+  addText(W/2, 120, 'SURGE!', '#f87171', 1.0);
+}
+
+// ---------- gate branch selection ----------
+// A pair always offers two DIFFERENT branches. 60% of single picks favor
+// invested branches (level>0), 40% fresh — exploratory early (everything is
+// fresh), build-completing late. After mastery lock only the two mastered
+// branches spawn; capped (lvl 6) branches never spawn.
+function pickPairBranches() {
+  let elig = BRANCHES.filter(br => P.br[br.key] < TUNE.branch.maxLevel);
+  if (locked) {
+    const m = masteredKeys();
+    elig = elig.filter(br => m.includes(br.key));
+    return elig.slice(0, 2);
+  }
+  const picked = [];
+  while (picked.length < 2 && elig.length) {
+    const inv = elig.filter(br => P.br[br.key] > 0);
+    const fresh = elig.filter(br => P.br[br.key] === 0);
+    let pool = (Math.random() < TUNE.gates.investedWeight && inv.length) ? inv
+             : (fresh.length ? fresh : inv);
+    const pick = pool[(Math.random() * pool.length) | 0];
+    picked.push(pick);
+    elig = elig.filter(br => br !== pick);
+  }
+  return picked;
+}
+function gateGain(g) { return g.tier + 1; }  // bronze +1 / silver +2 / gold +3
+function gateTo(g) { return Math.min(TUNE.branch.maxLevel, P.br[g.br.key] + gateGain(g)); }
+function gateIsKeystone(g) { return P.br[g.br.key] < 5 && gateTo(g) >= 5; }
+function gateLabel(g) {
+  return g.br.name + ' Lv' + P.br[g.br.key] + '→' + gateTo(g) + (gateIsKeystone(g) ? ' ★' : '');
+}
+function spawnGatePair() {
+  const branches = pickPairBranches();
+  if (!branches.length) return;
+  const pair = { groups: [] };
+  const centers = branches.length === 2 ? [W * 0.27, W * 0.73] : [W * 0.5];
+  const orcHp = squadOrcHp();
+  branches.forEach((br, gi) => {
+    const g = { cx: centers[gi], br, tier:0, pop:0, broken:false, rewarded:false, orcs: [] };
+    for (let i = 0; i < TUNE.gates.squadSize; i++) {
+      const ox = g.cx + (i % 3 - 1) * 26 + (Math.random() * 8 - 4);
+      const oy = -40 - ((i / 3) | 0) * 30 - Math.random() * 8;
+      g.orcs.push(spawnGrunt(ox, oy, g, orcHp));
+    }
+    pair.groups.push(g);
+  });
+  pairs.push(pair);
+}
+
+// ---------- fx ----------
+function addText(x, y, str, color, life) {
+  texts.push({ x, y, str, color, life: life || 1.4, max: life || 1.4 });
+}
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * 6.28, s = 40 + Math.random() * 140;
+    parts.push({ x, y, vx:Math.cos(a)*s, vy:Math.sin(a)*s, life:0.4+Math.random()*0.3, color });
+  }
+}
+function bannerPos(g) {
+  const alive = g.orcs.filter(o => !o.dead);
+  if (!alive.length) return null;
+  let minY = 1e9;
+  for (const o of alive) minY = Math.min(minY, o.y);
+  return { x: g.cx, y: Math.max(96, minY - 36) };
+}
+
+// ---------- levels / keystones / mastery ----------
+function gainLevels(br, n, source) {
+  const before = P.br[br.key];
+  P.br[br.key] = Math.min(TUNE.branch.maxLevel, before + n);
+  recompute();
+  if (before < 5 && P.br[br.key] >= 5) unlockKeystone(br);
+}
+function unlockKeystone(br) {
+  TELEMETRY.keystones.push({ branch: br.key, time: +time.toFixed(1), meters: meters | 0 });
+  addText(W/2, H/2 - 120, '★ KEYSTONE: ' + br.keystone + ' ★', br.color, 2.4);
+  timeScale = TUNE.bigBeat.scale; slowmoT = TUNE.bigBeat.dur;
+  beep(660, 0.3, 'square', 0.09); beep(990, 0.4, 'square', 0.07);
+  burst(P.x, P.y - 40, br.color, 30);
+  const m = masteredKeys();
+  if (m.length >= 2 && !locked) engageMasteryLock(m);
+}
+function engageMasteryLock(m) {
+  locked = true;
+  TELEMETRY.lock = { time: +time.toFixed(1), meters: meters | 0, build: m.slice() };
+  const names = m.map(k => BRANCHES.find(br => br.key === k).name).join(' + ');
+  addText(W/2, H/2 - 80, 'MASTERY LOCKED', '#e2e8f0', 2.6);
+  addText(W/2, H/2 - 52, names + ' — this run is YOURS', '#fbbf24', 2.6);
+  timeScale = TUNE.bigBeat.scale; slowmoT = TUNE.bigBeat.dur;
+  beep(220, 0.5, 'sawtooth', 0.09);
+  // on-screen gates of locked-out branches shatter — the door closes visibly
+  for (const pr of pairs) for (const g of pr.groups) {
+    if (!g.broken && !g.rewarded && !m.includes(g.br.key)) breakGate(g, 'locked');
+  }
+}
+
+// ---------- gate claim / break ----------
+function claimGate(g, atX, atY) {
+  g.rewarded = true;
+  const label = gateLabel(g);
+  TELEMETRY.claims.push({ branch: g.br.key, tier: g.tier, meters: meters | 0,
+                          time: +time.toFixed(1), dps: +rollingDps().toFixed(1) });
+  gainLevels(g.br, gateGain(g), 'gate');
+  flyers.push({ kind:'claim', x:atX, y:atY, label, color:g.br.color, frame:TIER_COLORS[g.tier], t:0 });
+  burst(atX, atY, TIER_COLORS[g.tier], 20);
+  if (slowmoT <= 0) { timeScale = TUNE.slowmo.scale; slowmoT = TUNE.slowmo.dur; }
+  beep(520, 0.15, 'square', 0.08); beep(780, 0.2, 'square', 0.08);
+  const pair = pairs.find(pr => pr.groups.includes(g));
+  if (pair) pair.groups.forEach(og => { if (og !== g && !og.rewarded) breakGate(og, 'rejected'); });
+}
+function breakGate(g, reason) {
+  if (g.broken || g.rewarded) return;
+  g.broken = true;
+  TELEMETRY.breaks.push({ branch: g.br.key, tier: g.tier, reason, meters: meters | 0, time: +time.toFixed(1) });
+  const pos = bannerPos(g) || { x:g.cx, y:LINE_Y - 60 };
+  g.orcs.forEach(o => o.group = null);
+  flyers.push({ kind:'break', x:pos.x, y:pos.y, label:gateLabel(g), color:g.br.color,
+                t:0, vx:(Math.random()*60-30), vy:-60, rot:0, vr:(Math.random()<0.5?-1:1)*(2+Math.random()*2) });
+  burst(pos.x, pos.y, '#94a3b8', 10);
+  if (reason === 'leaked') addText(pos.x, pos.y - 20, 'GATE LOST', '#94a3b8', 1.2);
+  beep(200, 0.12, 'sawtooth', 0.05);
+}
+
+// ---------- combat: the on-hit framework ----------
+// Bullets are plain objects: {dmg, pierce, rail, carry, carryOnly, incend,
+// ksMul}. ksMul is how strongly keystones act through this bullet: 1 for the
+// hero, 0.5 for allies under War Banner, 0 for plain allies.
+function igniteEnemy(e, dps) {
+  e.burnDps = Math.max(e.burnDps, dps);
+  e.burnT = TUNE.ks.burnDur;
+}
+function killEnemy(e) {
+  if (e.dead) return;
+  e.dead = true;
+  onEnemyKilled(e);
+}
+function hitEnemy(b, e) {
+  // Shieldbearer: shield eats the first N hits per second; piercing rounds
+  // (any pierce remaining) punch straight through — the railgun fantasy.
+  if (e.kind === 'shield' && e.shieldC > 0 && b.pierce <= 0 && !b.carryOnly) {
+    e.shieldC--;
+    parts.push({ x:e.x, y:e.y + e.r, vx:(Math.random()*80-40), vy:60, life:0.25, color:'#cbd5e1' });
+    b.dead = true;
+    return;
+  }
+  let dmg;
+  if (b.carryOnly) {           // overkill remnant: delivers the carry, then dies
+    dmg = b.carry; b.carry = 0; b.dead = true;
+  } else {
+    dmg = b.dmg + b.carry;     // any carried overkill lands on this victim
+    b.carry = 0;
+    if (P.ks.pierce && b.ksMul > 0)
+      dmg *= 1 + TUNE.ks.railPct * b.ksMul * b.rail;  // railgun: stacks within the shot
+  }
+  e.hp -= dmg;
+  dmgLog(dmg);
+  e.flash = 0.06;
+  const heavy = e.kind === 'boss' || e.kind === 'champion';
+  // impact position BEFORE the shove — splash must originate where the
+  // bodies collided, not where the victim ends up after being knocked back
+  const ix = e.x, iy = e.y;
+  e.y -= heavy ? 1.5 : P.knock;
+  if (b.incend) igniteEnemy(e, P.dmg * TUNE.ks.burnDpsMul * (b.ksMul || 1));
+  // Wall of Lead: the shove slams neighbors — splash proportional to the hit
+  if (P.ks.spread && b.ksMul > 0 && !heavy) {
+    const rr = TUNE.ks.wallRadius;
+    for (const o of enemies) {
+      if (o === e || o.dead) continue;
+      const dx = o.x - ix, dy = o.y - iy;
+      if (dx * dx + dy * dy < rr * rr) {
+        const wd = dmg * TUNE.ks.wallPct * b.ksMul;
+        o.hp -= wd; dmgLog(wd); o.flash = 0.05;
+        if (o.hp <= 0) killEnemy(o);
+      }
+    }
+  }
+  if (e.hp <= 0) {
+    killEnemy(e);
+    // Overkill: excess damage carries into the next enemy in the path
+    if (P.ks.fire && b.ksMul > 0 && -e.hp > TUNE.ks.overkillMin)
+      b.carry = -e.hp * b.ksMul;
+  }
+  if (b.dead) return;
+  b.rail++;
+  if (b.pierce > 0) b.pierce--;
+  else if (b.carry > TUNE.ks.overkillMin) b.carryOnly = true;  // lives to hand off the overkill
+  else b.dead = true;
+}
+
+// ---------- kill / leak ----------
+function onEnemyKilled(e) {
+  kills++;
+  const c = TUNE[e.kind === 'champion' ? 'champion' : e.kind];
+  if (c && c.meters) gainMeters(c.meters);
+  burst(e.x, e.y, e.kind === 'boss' ? '#f87171' : '#6ee7a0', e.kind === 'grunt' ? 14 : 26);
+  burst(e.x, e.y, '#365314', 6);
+  // Molten Barrel: burning enemies detonate — fire spreads to the clump
+  if (e.burnT > 0) {
+    const rr = TUNE.ks.burnRadius;
+    for (const o of enemies) {
+      if (o === e || o.dead || o.burnT > 0) continue;
+      const dx = o.x - e.x, dy = o.y - e.y;
+      if (dx * dx + dy * dy < rr * rr) igniteEnemy(o, e.burnDps);
+    }
+  }
+  if (e.kind === 'boss') { finishRun('win'); beep(660, 0.5, 'square', 0.1); return; }
+  if (e.kind === 'champion') { onChampionKilled(e); }
+  combo++; comboT = TUNE.feel.comboWindow;
+  beep(240 + Math.min(combo, 24) * 35, 0.05, 'square', 0.035);
+  killPulse = Math.min(180, killPulse + TUNE.feel.killPulse);
+  if ((e.kind === 'brute' || e.kind === 'shield') && slowmoT <= 0) {
+    timeScale = 0.1; slowmoT = TUNE.feel.hitstop;
+    shake = Math.max(shake, 5);
+  }
+  const g = e.group;
+  if (g) {
+    g.orcs = g.orcs.filter(o => o !== e);
+    if (!g.broken && !g.rewarded && g.orcs.length === 0) claimGate(g, e.x, e.y);
+  }
+}
+function onChampionKilled(e) {
+  champion = null;
+  championsKilled++;
+  meters = Math.max(meters, TUNE.acts.ends[championsKilled - 1]);
+  meters += TUNE.champion.meters;
+  // bounty: a guaranteed free SILVER gate of a random INVESTED branch —
+  // champions accelerate the build you already committed to
+  let pool = BRANCHES.filter(br => P.br[br.key] > 0 && P.br[br.key] < TUNE.branch.maxLevel);
+  if (locked) pool = pool.filter(br => masteredKeys().includes(br.key));
+  if (!pool.length) pool = BRANCHES.filter(br => P.br[br.key] < TUNE.branch.maxLevel);
+  if (pool.length) {
+    const br = pool[(Math.random() * pool.length) | 0];
+    const label = br.name + ' +2';
+    gainLevels(br, 2, 'champion');
+    flyers.push({ kind:'claim', x:e.x, y:e.y, label, color:br.color, frame:TIER_COLORS[1], t:0 });
+    addText(W/2, 300, 'CHAMPION BOUNTY: ' + label, TIER_COLORS[1], 2.2);
+  }
+  addText(W/2, 260, 'ACT ' + (championsKilled + 1) + ' BEGINS', '#e2e8f0', 2.4);
+  shake = 12;
+  timeScale = TUNE.bigBeat.scale; slowmoT = TUNE.bigBeat.dur;
+}
+function onEnemyLeaked(e) {
+  if (e.group) breakGate(e.group, 'leaked');
+  if (e.kind === 'boss') { P.hearts = 0; return; }
+  if (e.kind === 'champion') {
+    // a leaked champion still opens the act (no bounty) — no soft-lock
+    P.hearts -= TUNE.champion.hearts;
+    champion = null; championsKilled++;
+    meters = Math.max(meters, TUNE.acts.ends[championsKilled - 1]);
+    addText(W/2, 300, 'THE CHAMPION BROKE THROUGH', '#f87171', 2.2);
+  } else {
+    P.hearts -= TUNE[e.kind].hearts || 1;
+  }
+  heartsLost[actIdx()] += TUNE[e.kind === 'champion' ? 'champion' : e.kind].hearts || 1;
+  shake = 10;
+  burst(e.x, LINE_Y, '#f87171', 14);
+  beep(120, 0.2, 'sawtooth', 0.1);
+}
+function finishRun(result) {
+  TELEMETRY.runs.push({
+    result, build: { ...P.br }, keystones: TELEMETRY.keystones.map(k => k.branch),
+    act: actIdx() + 1, meters: meters | 0, time: +time.toFixed(1),
+    heartsLostPerAct: heartsLost.slice(), goldPct: TELEMETRY.goldPct,
+    claims: TELEMETRY.claims.length, breaks: TELEMETRY.breaks.length,
+  });
+  state = result === 'win' ? 'win' : 'over';
+}
+
+// ---------- update ----------
+function update(dt) {
+  time += dt;
+  const newSec = time | 0;
+  if (newSec !== dpsSec) { dpsSec = newSec; TELEMETRY.dpsRing[dpsSec % 60] = 0; }
+  const t = difficulty();
+
+  // hero movement
+  targetX = Math.max(24, Math.min(W - 24, targetX));
+  P.x += (targetX - P.x) * Math.min(1, dt * TUNE.hero.moveLerp);
+
+  // firing (hero + allies fire together; every Nth volley is molten)
+  P.fireT -= dt;
+  if (P.fireT <= 0) {
+    P.fireT = P.fireInt;
+    P.muzzle = 0.05;
+    P.shotNo++;
+    const molten = P.ks.vel && P.shotNo % TUNE.ks.moltenEvery === 0;
+    const spread = (P.shots - 1) * 7;
+    for (let s = 0; s < P.shots; s++) {
+      const off = P.shots === 1 ? 0 : -spread / 2 + s * 7;
+      bullets.push({ x:P.x + off, y:P.y - 26, vx:off * 1.2, vy:-P.bulletSpeed,
+                     dmg:P.dmg, pierce:P.pierce, rail:0, carry:0, carryOnly:false,
+                     incend:molten, ally:false, ksMul:1 });
+    }
+    const aMul = P.ks.cmd ? TUNE.ks.bannerMul : 0;
+    for (let a = 0; a < P.allies; a++) {
+      const side = a % 2 === 0 ? -1 : 1;
+      const ax = P.x + side * (34 + 28 * ((a / 2) | 0));
+      bullets.push({ x:ax, y:P.y - 8, vx:0, vy:-P.bulletSpeed * 0.9,
+                     dmg:P.dmg * P.allyDmgMul, pierce:P.ks.cmd ? Math.floor(P.pierce * aMul) : 0,
+                     rail:0, carry:0, carryOnly:false,
+                     incend:molten && P.ks.cmd, ally:true, ksMul:aMul });
+    }
+  }
+
+  // bullets
+  for (const b of bullets) { b.x += b.vx * dt; b.y += b.vy * dt; }
+  bullets = bullets.filter(b => b.y > -20 && b.x > -20 && b.x < W + 20 && !b.dead);
+
+  // enemies: march + per-kind behaviors + burn ticks
+  for (const e of enemies) {
+    if (e.dead) continue;
+    e.wob += dt * 5;
+    if (e.kind === 'shaman' && e.y >= TUNE.shaman.holdY) {
+      // shamans hold the backline and heal — a priority-target decision
+      e.healT -= dt;
+      if (e.healT <= 0) {
+        e.healT = TUNE.shaman.healEvery;
+        e.healFx = 0.4;
+        const rr = TUNE.shaman.healRadius;
+        for (const o of enemies) {
+          if (o === e || o.dead || o.kind === 'shaman' || o.kind === 'boss') continue;
+          const dx = o.x - e.x, dy = o.y - e.y;
+          if (dx * dx + dy * dy < rr * rr)
+            o.hp = Math.min(o.maxhp, o.hp + o.maxhp * TUNE.shaman.healPct);
+        }
+        beep(340, 0.15, 'sine', 0.05);
+      }
+    } else {
+      e.y += e.speed * dt;
+      e.x += Math.sin(e.wob) * 6 * dt;
+    }
+    if (e.kind === 'shield') {
+      // shield recharges to full each second — sustained focus beats it,
+      // scattered chip damage doesn't
+      e.shieldT += dt;
+      if (e.shieldT >= 1) { e.shieldT = 0; e.shieldC = TUNE.shield.blocksPerSec; }
+    }
+    if (e.kind === 'boss') {
+      const ph = e.hp > e.maxhp * 2/3 ? 1 : e.hp > e.maxhp / 3 ? 2 : 3;
+      e.phase = ph;
+      e.speed = TUNE.warlord.speed * (ph === 3 ? TUNE.warlord.phase3SpeedMul : 1);
+      if (ph >= 2) {
+        e.addT -= dt;
+        if (e.addT <= 0) {
+          e.addT = ph === 2 ? TUNE.warlord.addsPhase2Every : TUNE.warlord.addsPhase3Every;
+          for (let i = 0; i < 3; i++)
+            spawnGrunt(e.x + (Math.random() * 160 - 80), e.y + 30 + Math.random() * 30, null);
+        }
+      }
+    }
+    if (e.healFx > 0) e.healFx -= dt;
+    if (e.burnT > 0) {
+      e.burnT -= dt;
+      e.burnAcc += dt;
+      while (e.burnAcc >= 0.25) {          // burn ticks 4×/sec
+        e.burnAcc -= 0.25;
+        const bd = e.burnDps * 0.25;
+        e.hp -= bd; dmgLog(bd);
+        if (e.hp <= 0) { killEnemy(e); break; }
+      }
+      if (e.dead) continue;
+    }
+    if (e.y >= LINE_Y && !e.dead) { e.dead = true; onEnemyLeaked(e); }
+  }
+
+  // collisions
+  for (const b of bullets) {
+    if (b.dead) continue;
+    for (const e of enemies) {
+      if (e.dead) continue;
+      const dx = b.x - e.x, dy = b.y - e.y;
+      if (dx * dx + dy * dy < (e.r + 4) * (e.r + 4)) {
+        hitEnemy(b, e);
+        if (b.dead) break;
+      }
+    }
+  }
+  enemies = enemies.filter(e => !e.dead);
+  bullets = bullets.filter(b => !b.dead);
+  pairs = pairs.filter(pr => pr.groups.some(g => !g.broken && !g.rewarded && g.orcs.length));
+
+  // greed line: gates tier up as their squad nears your line
+  for (const pr of pairs) for (const g of pr.groups) {
+    if (g.broken || g.rewarded || !g.orcs.length) continue;
+    let front = -1e9;
+    for (const o of g.orcs) front = Math.max(front, o.y);
+    const frac = front / LINE_Y;
+    const newTier = frac >= TUNE.gates.tierAt[1] ? 2 : frac >= TUNE.gates.tierAt[0] ? 1 : 0;
+    if (newTier > g.tier) {
+      g.tier = newTier; g.pop = 0.35;
+      const pos = bannerPos(g);
+      if (pos) {
+        addText(pos.x, pos.y - 24, TIER_NAMES[newTier] + '!', TIER_COLORS[newTier], 1.1);
+        burst(pos.x, pos.y, TIER_COLORS[newTier], 10);
+      }
+      beep(newTier === 2 ? 940 : 700, 0.12, 'square', 0.06);
+    }
+    if (g.pop > 0) g.pop -= dt;
+  }
+
+  // spawning & act progression
+  const bossFight = !!champion || !!warlord;
+  if (!warlordSpawned) {
+    trickleT -= dt;
+    if (trickleT <= 0) {
+      // during a champion fight the stream thins — the fight is the focus
+      trickleT = (TUNE.trickle.startInt + (TUNE.trickle.endInt - TUNE.trickle.startInt) * Math.min(1, t))
+                 * (champion ? 2 : 1);
+      spawnTrickle();
+    }
+    surgeT -= dt;
+    if (surgeT <= 0) { surgeT = TUNE.surge.every; if (!champion) spawnSurge(); }
+    gateT -= dt;
+    if (gateT <= 0) {
+      gateT = TUNE.gates.min + Math.random() * (TUNE.gates.max - TUNE.gates.min);
+      if (!bossFight) spawnGatePair();
+    }
+    const a = actIdx();
+    if (!champion && a < 2 && meters >= TUNE.acts.ends[a]) spawnChampion();
+    if (!champion && a === 2 && meters >= TUNE.acts.ends[2] && !warlordSpawned) spawnWarlord();
+  }
+
+  // fx
+  for (const p of parts) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 300 * dt; p.life -= dt; }
+  parts = parts.filter(p => p.life > 0);
+  for (const ft of texts) { ft.y -= 22 * dt; ft.life -= dt; }
+  texts = texts.filter(ft => ft.life > 0);
+  for (const f of flyers) {
+    f.t += dt;
+    if (f.kind === 'claim') {
+      f.x += (P.x - f.x) * Math.min(1, dt * 9);
+      f.y += (P.y - 70 - f.y) * Math.min(1, dt * 9);
+      if (f.t > 0.55) { f.dead = true; addText(P.x, P.y - 70, f.label + '!', f.color, 1.6); }
+    } else {
+      f.vy += 500 * dt; f.x += f.vx * dt; f.y += f.vy * dt; f.rot += f.vr * dt;
+      if (f.t > 1.3) f.dead = true;
+    }
+  }
+  flyers = flyers.filter(f => !f.dead);
+
+  // combo bookkeeping: window closes → big chains pay out extra push
+  if (comboT > 0) {
+    comboT -= dt;
+    if (comboT <= 0 && combo > 0) {
+      if (combo >= TUNE.feel.comboMinPayout) {
+        const bonus = Math.round(combo / 2);
+        gainMeters(bonus);
+        addText(P.x, P.y - 90, 'COMBO ×' + combo + '  PUSH +' + bonus + 'm!', '#fbbf24', 1.6);
+        beep(880, 0.18, 'square', 0.07);
+      }
+      combo = 0;
+    }
+  }
+  if (P.muzzle > 0) P.muzzle -= dt;
+  killPulse = Math.max(0, killPulse - dt * 220);
+  shake = Math.max(0, shake - dt * 30);
+  scroll = (scroll + (30 + Math.min(1, t) * 30 + killPulse) * dt) % 64;
+
+  if (P.hearts <= 0 && state === 'play') { finishRun('over'); beep(70, 0.8, 'sawtooth', 0.12); }
+}
+
+// ---------- draw ----------
+function drawOrc(e) {
+  const flash = e.flash > 0;
+  if (e.flash > 0) e.flash -= 1 / 60;
+  if (e.group && !e.group.broken && !e.group.rewarded) {
+    ctx.strokeStyle = e.group.br.color; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.arc(e.x, e.y, e.r + 4, 0, 6.28); ctx.stroke();
+  }
+  const bodyColor =
+    e.kind === 'boss' ? '#b91c1c' :
+    e.kind === 'champion' ? '#9a3412' :
+    e.kind === 'shield' ? '#155e75' :
+    e.kind === 'shaman' ? '#6d28d9' :
+    e.kind === 'brute' ? '#65a30d' : '#4d7c0f';
+  ctx.fillStyle = flash ? '#ffffff' : bodyColor;
+  ctx.beginPath(); ctx.arc(e.x, e.y, e.r, 0, 6.28); ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,.4)'; ctx.lineWidth = 2; ctx.stroke();
+  ctx.fillStyle = flash ? '#000' : '#fde047';
+  ctx.beginPath(); ctx.arc(e.x - e.r * 0.35, e.y - e.r * 0.15, e.r * 0.16, 0, 6.28); ctx.fill();
+  ctx.beginPath(); ctx.arc(e.x + e.r * 0.35, e.y - e.r * 0.15, e.r * 0.16, 0, 6.28); ctx.fill();
+  ctx.fillStyle = '#f8fafc';
+  ctx.fillRect(e.x - e.r * 0.4, e.y + e.r * 0.3, 3, 5);
+  ctx.fillRect(e.x + e.r * 0.4 - 3, e.y + e.r * 0.3, 3, 5);
+  if (e.kind === 'shield') {
+    // shield arc faces the player; dims as charges are spent
+    const charged = e.shieldC / TUNE.shield.blocksPerSec;
+    ctx.strokeStyle = 'rgba(203,213,225,' + (0.25 + 0.65 * charged) + ')';
+    ctx.lineWidth = 4;
+    ctx.beginPath(); ctx.arc(e.x, e.y, e.r + 6, 0.35 * Math.PI, 0.65 * Math.PI); ctx.stroke();
+  }
+  if (e.kind === 'shaman') {
+    ctx.strokeStyle = '#a78bfa'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(e.x + e.r, e.y - e.r); ctx.lineTo(e.x + e.r + 6, e.y - e.r - 12); ctx.stroke();
+    if (e.healFx > 0) {
+      ctx.strokeStyle = 'rgba(74,222,128,' + (e.healFx * 2) + ')';
+      ctx.lineWidth = 2;
+      const rr = TUNE.shaman.healRadius * (1 - e.healFx / 0.4 * 0.3);
+      ctx.beginPath(); ctx.arc(e.x, e.y, rr, 0, 6.28); ctx.stroke();
+    }
+  }
+  if (e.kind === 'champion') {
+    // spiked pauldrons — reads as "elite" without art effort
+    ctx.fillStyle = '#7c2d12';
+    for (let i = -1; i <= 1; i++) {
+      ctx.beginPath();
+      ctx.moveTo(e.x + i * 12 - 5, e.y - e.r + 2);
+      ctx.lineTo(e.x + i * 12, e.y - e.r - 12);
+      ctx.lineTo(e.x + i * 12 + 5, e.y - e.r + 2);
+      ctx.closePath(); ctx.fill();
+    }
+  }
+  if (e.kind === 'boss') {
+    ctx.fillStyle = '#fbbf24';
+    ctx.beginPath();
+    ctx.moveTo(e.x - 24, e.y - e.r - 2);
+    ctx.lineTo(e.x - 24, e.y - e.r - 18); ctx.lineTo(e.x - 12, e.y - e.r - 6);
+    ctx.lineTo(e.x, e.y - e.r - 20); ctx.lineTo(e.x + 12, e.y - e.r - 6);
+    ctx.lineTo(e.x + 24, e.y - e.r - 18); ctx.lineTo(e.x + 24, e.y - e.r - 2);
+    ctx.closePath(); ctx.fill();
+  }
+  if (e.burnT > 0) {
+    // burning: flickering embers above the body
+    ctx.fillStyle = Math.random() < 0.5 ? '#fb923c' : '#fde047';
+    ctx.fillRect(e.x - 3 + Math.random() * 6, e.y - e.r - 6 - Math.random() * 4, 3, 4);
+  }
+  if (e.maxhp > 6 && e.hp < e.maxhp) {
+    const w = e.r * 2;
+    ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillRect(e.x - w/2, e.y - e.r - 10, w, 4);
+    ctx.fillStyle = '#f87171'; ctx.fillRect(e.x - w/2, e.y - e.r - 10, w * Math.max(0, e.hp / e.maxhp), 4);
+  }
+}
+
+function drawBanner(x, y, label, color, opts) {
+  const w = 158, h = 26;
+  const scale = (opts && opts.scale) || 1;
+  const rot = (opts && opts.rot) || 0;
+  const alpha = (opts && opts.alpha != null) ? opts.alpha : 1;
+  const frame = (opts && opts.frame) || color;
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(rot); ctx.scale(scale, scale);
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = 'rgba(10,12,18,.88)';
+  ctx.fillRect(-w/2, -h/2, w, h);
+  ctx.strokeStyle = frame; ctx.lineWidth = (opts && opts.tier) === 2 ? 3 : 2;
+  ctx.strokeRect(-w/2, -h/2, w, h);
+  if (opts && opts.tier != null) {
+    ctx.fillStyle = frame;
+    ctx.font = 'bold 9px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('★'.repeat(opts.tier + 1), 0, -h/2 - 7);
+  }
+  ctx.fillStyle = color;
+  ctx.font = 'bold 11px monospace'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(label, 0, 0);
+  if (opts && opts.keystone) {
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 10px monospace';
+    ctx.fillText('★ KEYSTONE ★', 0, h/2 + 9);
+  }
+  if (opts && opts.crossed) {
+    ctx.strokeStyle = '#f87171'; ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(-w/2 + 6, -h/2 + 4); ctx.lineTo(w/2 - 6, h/2 - 4);
+    ctx.moveTo(w/2 - 6, -h/2 + 4); ctx.lineTo(-w/2 + 6, h/2 - 4);
+    ctx.stroke();
+  }
+  ctx.restore();
+  ctx.globalAlpha = 1;
+}
+
+function drawGateBanner(g) {
+  const pos = bannerPos(g);
+  if (!pos || pos.y < 10) return;
+  const ks = gateIsKeystone(g);
+  // the "→5 ★KEYSTONE" gate is the game's signature beat — it pulses
+  const pulse = ks ? 1 + 0.07 * Math.sin(time * 9) : 1;
+  drawBanner(pos.x, pos.y, gateLabel(g), g.br.color,
+             { frame: TIER_COLORS[g.tier], tier: g.tier, keystone: ks,
+               scale: (1 + Math.max(0, g.pop) * 0.8) * pulse });
+  const alive = g.orcs.filter(o => !o.dead);
+  ctx.strokeStyle = 'rgba(148,163,184,.5)'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(pos.x - 56, pos.y + 13); ctx.lineTo(alive[0].x, alive[0].y);
+  ctx.moveTo(pos.x + 56, pos.y + 13); ctx.lineTo(alive[alive.length-1].x, alive[alive.length-1].y);
+  ctx.stroke();
+}
+
+function drawHero() {
+  const lvl = Math.min(6, P.gunLvl);
+  for (let a = 0; a < P.allies; a++) {
+    const side = a % 2 === 0 ? -1 : 1;
+    const ax = P.x + side * (34 + 28 * ((a / 2) | 0));
+    ctx.fillStyle = P.ks.cmd ? '#fb923c' : '#93c5fd';   // banner-empowered allies glow orange
+    ctx.beginPath(); ctx.arc(ax, P.y + 4, 9, 0, 6.28); ctx.fill();
+    ctx.fillStyle = '#475569'; ctx.fillRect(ax - 2, P.y - 14, 4, 14);
+  }
+  ctx.fillStyle = '#e2e8f0';
+  ctx.beginPath(); ctx.arc(P.x, P.y, 15, 0, 6.28); ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth = 2; ctx.stroke();
+  const gw = 6 + lvl * 2, gl = 26 + lvl * 3;
+  ctx.fillStyle = ['#64748b','#64748b','#0ea5e9','#0ea5e9','#a855f7','#a855f7','#f59e0b'][lvl];
+  ctx.fillRect(P.x - gw/2, P.y - 14 - gl, gw, gl);
+  ctx.fillStyle = '#334155';
+  ctx.fillRect(P.x - gw/2 - 2, P.y - 16, gw + 4, 8);
+  if (P.muzzle > 0) {
+    const my = P.y - 14 - gl;
+    ctx.fillStyle = 'rgba(255,240,150,.9)';
+    ctx.beginPath();
+    ctx.arc(P.x, my - 4, 5 + Math.random() * 3, 0, 6.28);
+    ctx.fill();
+  }
+}
+
+function drawUI() {
+  const bw = W - 120, bx = 20, by = 20;
+  // overall push bar with act boundary ticks
+  ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillRect(bx, by, bw, 12);
+  ctx.fillStyle = '#4ade80';
+  ctx.fillRect(bx, by, bw * Math.min(1, meters / TUNE.acts.ends[2]), 12);
+  ctx.strokeStyle = '#334155'; ctx.strokeRect(bx, by, bw, 12);
+  ctx.fillStyle = '#0b0e14';
+  for (const end of [TUNE.acts.ends[0], TUNE.acts.ends[1]])
+    ctx.fillRect(bx + bw * end / TUNE.acts.ends[2] - 1, by - 2, 2, 16);
+  ctx.fillStyle = '#94a3b8';
+  ctx.fillRect(bx + bw + 8, by - 4, 20, 20);
+  ctx.fillRect(bx + bw + 6, by - 8, 4, 6); ctx.fillRect(bx + bw + 16, by - 8, 4, 6); ctx.fillRect(bx + bw + 26, by - 8, 4, 6);
+  ctx.fillStyle = '#e2e8f0'; ctx.font = 'bold 12px monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.fillText('ACT ' + (actIdx() + 1) + '  ' + (meters | 0) + 'm / ' + TUNE.acts.ends[2] + 'm', bx, by + 16);
+  ctx.textAlign = 'right';
+  for (let i = 0; i < 10; i++) {
+    ctx.fillStyle = i < P.hearts ? '#f87171' : 'rgba(255,255,255,.12)';
+    ctx.fillRect(W - 24 - i * 14, by + 16, 10, 10);
+  }
+  ctx.fillStyle = '#94a3b8'; ctx.font = '11px monospace';
+  ctx.fillText('KILLS ' + kills, W - 20, by + 30);
+
+  // build pips: 5 branches × 6 slots; ★ marks a live keystone, dim = locked out
+  const m = masteredKeys();
+  for (let i = 0; i < BRANCHES.length; i++) {
+    const br = BRANCHES[i], lvl = P.br[br.key];
+    const x0 = 18 + i * 92, y0 = by + 34;
+    const isLockedOut = locked && !m.includes(br.key);
+    ctx.globalAlpha = isLockedOut ? 0.25 : 1;
+    ctx.fillStyle = br.color;
+    ctx.font = 'bold 9px monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillText(br.abbr + (lvl >= 5 ? ' ★' : ''), x0, y0);
+    for (let s = 0; s < TUNE.branch.maxLevel; s++) {
+      ctx.fillStyle = s < lvl ? br.color : 'rgba(255,255,255,.12)';
+      ctx.fillRect(x0 + s * 11, y0 + 11, 8, 5);
+    }
+    if (isLockedOut) {
+      ctx.strokeStyle = '#f87171'; ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(x0, y0 + 8); ctx.lineTo(x0 + 66, y0 + 8);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  if (combo >= 4 && comboT > 0) {
+    const pulse = 1 + Math.min(combo, 30) * 0.02 + comboT * 0.15;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.font = 'bold ' + ((22 * pulse) | 0) + 'px monospace';
+    ctx.fillStyle = combo >= TUNE.feel.comboMinPayout ? '#fbbf24' : '#e2e8f0';
+    ctx.fillText('×' + combo, W / 2, 112);
+  }
+  // input diagnostics (tiny): d=downs m=moves u=ups c=cancels t=touch evts
+  ctx.textAlign = 'left'; ctx.font = '9px monospace';
+  ctx.fillStyle = 'rgba(148,163,184,.45)';
+  ctx.fillText('in d' + inStats.d + ' m' + inStats.m + ' u' + inStats.u + ' c' + inStats.c + ' t' + inStats.t + ' x' + (inStats.lastX|0), 8, H - 14);
+}
+
+function drawDebug() {
+  const x = 12, y = 130, w = 300;
+  ctx.fillStyle = 'rgba(4,6,10,.82)';
+  ctx.fillRect(x, y, w, 250);
+  ctx.strokeStyle = '#334155'; ctx.strokeRect(x, y, w, 250);
+  ctx.font = '10px monospace'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.fillStyle = '#e2e8f0';
+  let ln = 0;
+  const line = s => { ctx.fillText(s, x + 8, y + 8 + 13 * ln++); };
+  line('DEBUG  fps ' + fpsVal + '  ent ' + enemies.length + 'e/' + bullets.length + 'b/' + parts.length + 'p');
+  line('act ' + (actIdx() + 1) + '  t=' + difficulty().toFixed(2) + '  dps~' + rollingDps().toFixed(0)
+       + '  sqOrcHp ' + squadOrcHp().toFixed(1));
+  line('build ' + BRANCHES.map(br => br.abbr + ':' + P.br[br.key]).join(' '));
+  line('claims ' + TELEMETRY.claims.length + ' (gold ' + TELEMETRY.goldPct + '%)  breaks ' + TELEMETRY.breaks.length);
+  line('keystones ' + (TELEMETRY.keystones.map(k => k.branch + '@' + k.time + 's').join(', ') || '—'));
+  line('lock ' + (TELEMETRY.lock ? TELEMETRY.lock.build.join('+') + ' @' + TELEMETRY.lock.time + 's' : '—'));
+  line('hearts lost/act ' + heartsLost.join(' / '));
+  const recent = TELEMETRY.claims.slice(-4);
+  line('last claims:');
+  for (const c of recent)
+    line('  ' + c.branch + ' ' + TIER_NAMES[c.tier] + ' @' + c.meters + 'm dps' + c.dps);
+  // rolling DPS graph, last 60s
+  const gx = x + 8, gy = y + 242, gw2 = w - 16, gh = 40;
+  let peak = 1;
+  for (let i = 0; i < 60; i++) peak = Math.max(peak, TELEMETRY.dpsRing[i]);
+  ctx.fillStyle = '#38bdf8';
+  for (let i = 0; i < 60; i++) {
+    const v = TELEMETRY.dpsRing[(dpsSec - 59 + i + 120) % 60];
+    const h2 = gh * v / peak;
+    ctx.fillRect(gx + i * (gw2 / 60), gy - h2, gw2 / 60 - 1, h2);
+  }
+  ctx.fillStyle = '#64748b';
+  ctx.fillText('dps last 60s (peak ' + peak.toFixed(0) + '/s)', gx, gy - gh - 12);
+}
+
+function overlay(title, sub, color) {
+  ctx.fillStyle = 'rgba(6,8,12,.78)'; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.fillStyle = color; ctx.font = 'bold 34px monospace'; ctx.textBaseline = 'middle';
+  ctx.fillText(title, W/2, H/2 - 130);
+  ctx.fillStyle = '#e2e8f0'; ctx.font = '14px monospace';
+  const lines = sub.split('\n');
+  lines.forEach((l, i) => ctx.fillText(l, W/2, H/2 - 80 + i * 22));
+  if ((performance.now() / 500 | 0) % 2 === 0) {
+    ctx.fillStyle = '#4ade80'; ctx.font = 'bold 16px monospace';
+    ctx.fillText('▶ TAP / CLICK TO ' + (state === 'menu' ? 'START' : 'RETRY'), W/2, H/2 + 160);
+  }
+}
+function buildSummary() {
+  const parts2 = BRANCHES.filter(br => P.br[br.key] > 0)
+    .map(br => br.name + ' ' + P.br[br.key] + (P.br[br.key] >= 5 ? '★' : ''));
+  return parts2.length ? parts2.join('\n') : 'no build';
+}
+
+function draw() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (shake > 0) ctx.translate((Math.random()-0.5) * shake, (Math.random()-0.5) * shake);
+
+  ctx.fillStyle = '#1c2431'; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = 'rgba(255,255,255,.03)';
+  for (let y = -64 + scroll; y < H; y += 64) ctx.fillRect(0, y, W, 26);
+  ctx.strokeStyle = 'rgba(248,113,113,.55)'; ctx.lineWidth = 2;
+  ctx.setLineDash([10, 8]);
+  ctx.beginPath(); ctx.moveTo(0, LINE_Y); ctx.lineTo(W, LINE_Y); ctx.stroke();
+  ctx.setLineDash([]);
+
+  for (const b of bullets) {
+    // tracer: soft glow trail + bright core; molten rounds burn orange
+    const glow = b.incend ? 'rgba(251,146,60,.35)' : b.ally ? 'rgba(147,197,253,.25)' : 'rgba(253,224,71,.28)';
+    const core = b.incend ? '#fb923c' : b.ally ? '#93c5fd' : '#fde047';
+    ctx.fillStyle = glow;
+    ctx.fillRect(b.x - 3.5, b.y - 18, 7, 24);
+    ctx.fillStyle = core;
+    ctx.fillRect(b.x - 2, b.y - 10, 4, 14);
+    ctx.fillStyle = '#fffbe6';
+    ctx.fillRect(b.x - 1, b.y - 8, 2, 8);
+  }
+  for (const e of enemies) drawOrc(e);
+  for (const pr of pairs) for (const g of pr.groups) if (!g.broken && !g.rewarded && g.orcs.length) drawGateBanner(g);
+  if (P) drawHero();
+  for (const p of parts) {
+    ctx.globalAlpha = Math.max(0, p.life / 0.6);
+    ctx.fillStyle = p.color;
+    ctx.fillRect(p.x - 2, p.y - 2, 4, 4);
+    ctx.globalAlpha = 1;
+  }
+  for (const f of flyers) {
+    if (f.kind === 'claim') drawBanner(f.x, f.y, f.label, f.color, { scale: 1 + f.t * 0.7, frame: f.frame });
+    else drawBanner(f.x, f.y, f.label, '#64748b', { rot: f.rot, alpha: Math.max(0, 1 - f.t / 1.3), crossed: true });
+  }
+  for (const ft of texts) {
+    ctx.globalAlpha = Math.min(1, ft.life / ft.max * 1.6);
+    ctx.fillStyle = ft.color; ctx.font = 'bold 16px monospace';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText(ft.str, ft.x, ft.y);
+    ctx.globalAlpha = 1;
+  }
+  if (P) drawUI();
+  if (debugOn && P) drawDebug();
+
+  if (timeScale < 1) {
+    ctx.fillStyle = 'rgba(56,189,248,.06)';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  if (state === 'menu') {
+    overlay('PROTOTYPE 11', 'REVERSE GATE RUNNER\nBUILD IDENTITY\n\nDrag to move — you fire automatically.\nOrc squads carry BRANCH gates:\nwipe a squad to level that branch.\nBRONZE +1 · SILVER +2 · GOLD +3\n\nLv5 unlocks a KEYSTONE.\nOnly TWO branches can reach Lv5 —\nyour second keystone LOCKS the rest.\nA run IS its two keystones.\n\n3 acts · 1000m · slay the Warlord.\n(D or triple-tap corner: debug)', '#4ade80');
+  } else if (state === 'over') {
+    overlay('OVERRUN', 'The horde broke through in ACT ' + (actIdx() + 1) + '.\n\nPushed: ' + (meters|0) + 'm · Kills: ' + kills + '\n\n' + buildSummary(), '#f87171');
+  } else if (state === 'win') {
+    overlay('WARLORD SLAIN', 'The horde is broken. ' + (time/60|0) + 'm' + ((time|0)%60) + 's.\nKills: ' + kills + '\n\n' + buildSummary(), '#fbbf24');
+  }
+}
+
+// ---------- main loop ----------
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.033, (now - last) / 1000);
+  last = now;
+  fpsFrames++;
+  if (now - fpsLast >= 1000) { fpsVal = fpsFrames; fpsFrames = 0; fpsLast = now; }
+  if (state === 'play') {
+    slowmoT -= dt;
+    if (slowmoT <= 0) timeScale = 1;
+    update(dt * timeScale);
+  }
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// =====================================================================
+// SELF-PLAYTEST PASS — intended playstyle per keystone pair (5C2 = 10):
+// FIRE+VEL   "Meteor hose": fast incendiary artillery; burns finish what
+//            big hits start. Plays as sustained pressure everywhere.
+// FIRE+SPRD  "Demolition wall": huge hits whose overkill + shove-splash
+//            detonate clumps. Plays as walking into crowds on purpose.
+// FIRE+PRC   "Railgun sniper": one column simply stops existing; overkill
+//            rides the pierce chain. Plays as lane-switching executions.
+// FIRE+CMD   "Warband of cannons": few but massive volleys from the whole
+//            squad (allies carry 50% overkill). Plays as a firing line.
+// VEL+SPRD   "Bullet storm": max projectiles/sec + widest coverage; burn
+//            spread turns density into chain fires. Plays as area denial.
+// VEL+PRC    "Incendiary lances": fast piercing shots that ignite whole
+//            columns. Plays as raking fire across the corridor.
+// VEL+CMD    "Firing squad": everyone shoots fast, allies join the molten
+//            rhythm. Plays as overwhelming tempo.
+// SPRD+PRC   "Lattice": wide piercing fans that comb the entire screen.
+//            Plays as geometry — position for maximum overlap.
+// SPRD+CMD   "Phalanx": bodies + knockback own the front line; collision
+//            damage grinds. Plays as holding ground, not bursting.
+// PRC+CMD    "Volley line": ally railguns (50%) rake columns beside yours.
+//            Plays as commanding two extra lanes at once.
+// FLAG: FIRE+CMD vs VEL+CMD both read as "shooty squad" — COMMAND may need
+// a more distinct fantasy than 'more of your build'. Noted in CHANGES.md.
+// =====================================================================
+</script>
+</body>
+</html>
